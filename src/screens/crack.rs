@@ -6,11 +6,10 @@
  * Can use native CPU cracking or external GPU tools (hashcat + hcxtools).
  */
 
-use iced::widget::{
-    button, column, container, horizontal_space, pick_list, row, scrollable, text, text_input,
-};
+use iced::widget::{button, column, container, horizontal_space, pick_list, row, text, text_input};
 use iced::{Element, Length};
 
+use super::components;
 use crate::messages::Message;
 use crate::theme::{self, colors};
 use serde::{Deserialize, Serialize};
@@ -138,28 +137,17 @@ impl Default for CrackScreen {
 
 impl CrackScreen {
     pub fn view(&self, is_root: bool) -> Element<'_, Message> {
-        let title = text("Crack Password").size(28).color(colors::TEXT);
-
-        let subtitle = text("Bruteforce WPA/WPA2 password from captured handshake")
-            .size(14)
-            .color(colors::TEXT_DIM);
+        let header = components::page_header(
+            "Crack Password",
+            "Bruteforce a WPA/WPA2 password from a captured handshake",
+        );
 
         let root_warning = if is_root {
-            Some(
-                container(
-                    column![
-                        text("File access limited in admin mode")
-                            .size(12)
-                            .color(colors::TEXT),
-                        text("Capture will automatically return to normal mode once finished.")
-                            .size(10)
-                            .color(colors::TEXT_DIM),
-                    ]
-                    .spacing(6),
-                )
-                .padding(10)
-                .style(theme::card_style),
-            )
+            Some(components::callout(
+                colors::WARNING,
+                "Running in admin mode",
+                &["Cracking doesn't need admin rights — it works in normal mode too."],
+            ))
         } else {
             None
         };
@@ -192,7 +180,7 @@ impl CrackScreen {
         };
 
         let mut engine_picker = column![
-            text("Cracking Engine").size(13).color(colors::TEXT),
+            components::field_label("Cracking Engine"),
             pick_list(engine_options, Some(self.engine), Message::EngineChanged,)
                 .padding(10)
                 .style(theme::pick_list_style)
@@ -242,7 +230,7 @@ impl CrackScreen {
 
         // Handshake file input (required)
         let handshake_input = column![
-            text("Handshake File *").size(13).color(colors::TEXT),
+            components::field_label("Handshake File *"),
             row![
                 text_input("Select a .cap/.pcap file", &self.handshake_path)
                     .on_input(Message::HandshakePathChanged)
@@ -261,7 +249,7 @@ impl CrackScreen {
 
         // Method selection
         let method_picker = column![
-            text("Attack Method").size(13).color(colors::TEXT),
+            components::field_label("Attack Method"),
             pick_list(
                 vec![CrackMethod::Numeric, CrackMethod::Wordlist],
                 Some(self.method),
@@ -433,82 +421,47 @@ impl CrackScreen {
             };
 
         // Result display
-        let result_display = if let Some(ref password) = self.found_password {
-            Some(
-                container(
-                    column![
-                        text("Password Found!").size(18).color(colors::SUCCESS),
-                        container(
-                            row![
-                                text(password).size(24).color(colors::ACCENT),
-                                horizontal_space(),
-                                button(text("Copy").size(13))
-                                    .padding([8, 15])
-                                    .style(theme::secondary_button_style)
-                                    .on_press(Message::CopyPassword),
-                            ]
-                            .align_y(iced::Alignment::Center)
-                            .padding(15)
-                        )
-                        .style(theme::callout_style(colors::SUCCESS)),
-                    ]
-                    .spacing(10)
-                    .padding(15),
+        let result_display: Option<Element<Message>> =
+            if let Some(ref password) = self.found_password {
+                Some(
+                    container(
+                        column![
+                            text("Password Found!").size(18).color(colors::SUCCESS),
+                            container(
+                                row![
+                                    text(password).size(24).color(colors::ACCENT),
+                                    horizontal_space(),
+                                    button(text("Copy").size(13))
+                                        .padding([8, 15])
+                                        .style(theme::secondary_button_style)
+                                        .on_press(Message::CopyPassword),
+                                ]
+                                .align_y(iced::Alignment::Center)
+                                .padding(15)
+                            )
+                            .style(theme::callout_style(colors::SUCCESS)),
+                        ]
+                        .spacing(10)
+                        .padding(15),
+                    )
+                    .style(theme::card_style)
+                    .into(),
                 )
-                .style(theme::card_style),
-            )
-        } else if self.password_not_found {
-            Some(
-                container(
-                    column![
-                        text("Password Not Found").size(18).color(colors::DANGER),
-                        container(
-                            text("The password was not found in the tested combinations")
-                                .size(14)
-                                .color(colors::TEXT)
-                        )
-                        .padding(15)
-                        .style(|_| container::Style {
-                            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                                0.86, 0.21, 0.27, 0.2
-                            ))),
-                            border: iced::Border {
-                                color: colors::DANGER,
-                                width: 2.0,
-                                radius: 6.0.into(),
-                            },
-                            ..Default::default()
-                        }),
-                    ]
-                    .spacing(10)
-                    .padding(15),
-                )
-                .style(theme::card_style),
-            )
-        } else {
-            None
-        };
+            } else if self.password_not_found {
+                Some(components::callout(
+                    colors::DANGER,
+                    "Password Not Found",
+                    &["The password was not in the tested combinations."],
+                ))
+            } else {
+                None
+            };
 
         // Error display
-        let error_display = self.error_message.as_ref().map(|msg| {
-            container(
-                text(format!("Error: {}", msg))
-                    .size(13)
-                    .color(colors::DANGER),
-            )
-            .padding(10)
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.86, 0.21, 0.27, 0.15,
-                ))),
-                border: iced::Border {
-                    color: colors::DANGER,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..Default::default()
-            })
-        });
+        let error_display = self
+            .error_message
+            .as_ref()
+            .map(|msg| components::error_banner(msg));
 
         // Control buttons
         let crack_btn = if self.is_cracking {
@@ -546,36 +499,11 @@ impl CrackScreen {
             .on_press(Message::GoToScanCapture);
 
         // Logs display
-        let logs_display = if !self.log_messages.is_empty() {
-            Some(
-                container(
-                    column![
-                        text("Logs").size(13).color(colors::TEXT),
-                        scrollable(
-                            container(
-                                text(self.log_messages.join("\n"))
-                                    .size(11)
-                                    .color(colors::TEXT_DIM)
-                            )
-                            .padding(10)
-                            .width(Length::Fill)
-                            .style(theme::panel_style)
-                        )
-                        .height(Length::Fixed(150.0))
-                    ]
-                    .spacing(8)
-                    .padding(15),
-                )
-                .style(theme::card_style),
-            )
-        } else {
-            None
-        };
+        let logs_display = components::log_panel(&self.log_messages);
 
         // Build layout
         let mut content = column![
-            title,
-            subtitle,
+            header,
             engine_picker,
             engine_info,
             handshake_input,

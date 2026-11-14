@@ -11,6 +11,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Theme};
 
+use super::components;
 use crate::messages::Message;
 use crate::theme::{self, colors};
 use brutifi::WifiNetwork;
@@ -252,12 +253,7 @@ impl ScanCaptureScreen {
                     };
                     let badges = row(attack_methods
                         .iter()
-                        .map(|m| {
-                            container(text(*m).size(8).color(colors::ACCENT))
-                                .padding([1, 6])
-                                .style(theme::badge_style(colors::ACCENT))
-                                .into()
-                        })
+                        .map(|m| components::pill(m, colors::ACCENT))
                         .collect::<Vec<Element<Message>>>())
                     .spacing(4);
 
@@ -362,35 +358,11 @@ impl ScanCaptureScreen {
 
         // ========== NETWORK INFO BLOCK ==========
         let network_info_block: Element<'_, Message> = if let Some(network) = &self.target_network {
-            // Build column elements
             let mut col_elements: Vec<Element<Message>> = vec![
-                row![
-                    text("Network:")
-                        .size(11)
-                        .color(colors::TEXT_DIM)
-                        .width(Length::Fixed(80.0)),
-                    text(&network.ssid).size(12).color(colors::TEXT),
-                ]
-                .spacing(8)
-                .into(),
-                row![
-                    text("Channel:")
-                        .size(11)
-                        .color(colors::TEXT_DIM)
-                        .width(Length::Fixed(80.0)),
-                    text(&network.channel).size(11).color(colors::TEXT),
-                ]
-                .spacing(8)
-                .into(),
-                row![
-                    text("Security:")
-                        .size(11)
-                        .color(colors::TEXT_DIM)
-                        .width(Length::Fixed(80.0)),
-                    text(&network.security).size(11).color(colors::PRIMARY),
-                ]
-                .spacing(8)
-                .into(),
+                components::section_title("Target"),
+                components::labeled_value("Network", &network.ssid, colors::TEXT),
+                components::labeled_value("Channel", &network.channel, colors::TEXT),
+                components::labeled_value("Security", &network.security, colors::PRIMARY),
             ];
 
             // Add channel selector if multiple channels
@@ -416,44 +388,27 @@ impl ScanCaptureScreen {
             }
 
             col_elements.push(horizontal_rule(1).into());
-            col_elements.push(
-                row![
-                    text("Output file:")
-                        .size(11)
-                        .color(colors::TEXT_DIM)
-                        .width(Length::Fixed(80.0)),
-                    text(&self.output_file).size(10).color(colors::SUCCESS),
-                ]
-                .spacing(8)
-                .into(),
-            );
+            col_elements.push(components::labeled_value(
+                "Output",
+                &self.output_file,
+                colors::SUCCESS,
+            ));
             col_elements.push(
                 button(text("Change location").size(11))
-                    .padding([5, 10])
+                    .padding([6, 12])
                     .style(theme::secondary_button_style)
                     .on_press(Message::BrowseCaptureFile)
                     .into(),
             );
 
-            container(column(col_elements).spacing(6))
-                .padding(12)
-                .width(Length::Fill)
-                .style(theme::card_style)
-                .into()
+            components::card(column(col_elements).spacing(8))
         } else {
-            container(
-                column![
-                    text("No network selected").size(12).color(colors::TEXT_DIM),
-                    text("Select a network from the list on the left to begin")
-                        .size(10)
-                        .color(colors::TEXT_DIM),
-                ]
-                .spacing(4),
-            )
-            .padding(12)
-            .width(Length::Fill)
-            .style(theme::card_style)
-            .into()
+            components::card(column![
+                components::section_title("No network selected"),
+                text("Select a network from the list on the left to begin.")
+                    .size(11)
+                    .color(colors::TEXT_DIM),
+            ])
         };
 
         // ========== STATUS BLOCK ==========
@@ -543,41 +498,13 @@ impl ScanCaptureScreen {
         };
 
         // ========== LOGS BLOCK ==========
-        let logs_block: Option<Element<'_, Message>> = if !self.log_messages.is_empty() {
-            Some(
-                container(
-                    column![
-                        text("Logs").size(13).color(colors::TEXT),
-                        scrollable(
-                            container(
-                                text(self.log_messages.join("\n"))
-                                    .size(11)
-                                    .color(colors::TEXT_DIM)
-                            )
-                            .padding(10)
-                            .width(Length::Fill)
-                            .style(theme::panel_style)
-                        )
-                        .height(Length::Fixed(150.0))
-                    ]
-                    .spacing(8)
-                    .padding(15),
-                )
-                .style(theme::card_style)
-                .into(),
-            )
-        } else {
-            None
-        };
+        let logs_block = components::log_panel(&self.log_messages);
 
         // ========== ERROR BLOCK ==========
-        let error_block: Option<Element<'_, Message>> = self.error_message.as_ref().map(|msg| {
-            container(text(msg).size(11).color(colors::DANGER))
-                .padding(12)
-                .width(Length::Fill)
-                .style(theme::callout_style(colors::DANGER))
-                .into()
-        });
+        let error_block = self
+            .error_message
+            .as_ref()
+            .map(|msg| components::error_banner(msg));
 
         // ========== ACTION BUTTONS ==========
         let action_buttons: Element<'_, Message> = {
@@ -778,13 +705,6 @@ fn security_badge(security: &str) -> Element<'static, Message> {
     } else {
         colors::TEXT_DIM
     };
-    let label = if is_open {
-        "Open".to_string()
-    } else {
-        security.to_string()
-    };
-    container(text(label).size(9).color(color))
-        .padding([3, 8])
-        .style(theme::badge_style(color))
-        .into()
+    let label = if is_open { "Open" } else { security };
+    components::pill(label, color)
 }
