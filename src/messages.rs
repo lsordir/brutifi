@@ -6,8 +6,10 @@
 
 use std::path::PathBuf;
 
+use brutifi::FakeApStatus;
+
 use crate::screens::{CrackEngine, CrackMethod};
-use crate::workers::{CaptureProgress, CrackProgress, ScanResult};
+use crate::workers::{CaptureProgress, CrackProgress, FakeApProgress, PortalProgress, ScanResult};
 
 /// Application messages
 #[derive(Debug, Clone)]
@@ -37,6 +39,16 @@ pub enum Message {
     CaptureProgress(CaptureProgress),
     #[allow(dead_code)]
     EnableAdminMode,
+
+    // Fake AP (rogue open access point)
+    FakeApSsidChanged(String),
+    UseTargetSsidForFakeAp,
+    StartFakeAp,
+    StopFakeAp,
+    FakeApStatusChecked(FakeApStatus),
+    FakeApProgress(FakeApProgress),
+    PortalToggled(bool),
+    PortalProgress(PortalProgress),
 
     // Crack screen
     HandshakePathChanged(String),

@@ -28,6 +28,18 @@ impl BruteforceApp {
             }
         }
 
+        // Poll for fake AP / captive portal progress
+        if let Some(ref mut rx) = self.fake_ap_progress_rx {
+            while let Ok(progress) = rx.try_recv() {
+                messages.push(Message::FakeApProgress(progress));
+            }
+        }
+        if let Some(ref mut rx) = self.portal_progress_rx {
+            while let Ok(progress) = rx.try_recv() {
+                messages.push(Message::PortalProgress(progress));
+            }
+        }
+
         if !messages.is_empty() {
             return Task::batch(messages.into_iter().map(Task::done));
         }

@@ -41,6 +41,11 @@ pub struct BruteforceApp {
     pub(crate) crack_state: Option<Arc<CrackState>>,
     pub(crate) crack_progress_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<workers::CrackProgress>>,
+    pub(crate) fake_ap_progress_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<workers::FakeApProgress>>,
+    pub(crate) portal_state: Option<Arc<brutifi::PortalState>>,
+    pub(crate) portal_progress_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<workers::PortalProgress>>,
 }
 
 impl BruteforceApp {
@@ -61,6 +66,9 @@ impl BruteforceApp {
             capture_progress_rx: None,
             crack_state: None,
             crack_progress_rx: None,
+            fake_ap_progress_rx: None,
+            portal_state: None,
+            portal_progress_rx: None,
         };
 
         if let Some(persisted) = load_persisted_state() {
@@ -104,7 +112,24 @@ impl BruteforceApp {
             && app.screen == Screen::ScanCapture
             && app.scan_capture_screen.target_network.is_some()
         {
-            (app, Task::done(Message::StartCapture))
+            let startup_tasks = vec![
+                Task::done(Message::StartCapture),
+                Task::perform(
+                    workers::fake_ap_status_async(),
+                    Message::FakeApStatusChecked,
+                ),
+            ];
+            (app, Task::batch(startup_tasks))
+        } else if is_root {
+            // Detect an already-broadcasting fake AP (e.g. left over from a
+            // previous session) so the UI can offer to stop it.
+            (
+                app,
+                Task::perform(
+                    workers::fake_ap_status_async(),
+                    Message::FakeApStatusChecked,
+                ),
+            )
         } else {
             (app, Task::none())
         }
@@ -117,7 +142,11 @@ impl BruteforceApp {
     pub fn subscription(&self) -> Subscription<Message> {
         // Poll for capture and crack progress updates
         // Reduced from 100ms to 50ms for more responsive UI while maintaining performance
-        if self.capture_progress_rx.is_some() || self.crack_progress_rx.is_some() {
+        if self.capture_progress_rx.is_some()
+            || self.crack_progress_rx.is_some()
+            || self.fake_ap_progress_rx.is_some()
+            || self.portal_progress_rx.is_some()
+        {
             time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick)
         } else {
             Subscription::none()
@@ -151,6 +180,16 @@ impl BruteforceApp {
             Message::SendDeauth => self.handle_send_deauth(),
             Message::CaptureProgress(progress) => self.handle_capture_progress(progress),
             Message::EnableAdminMode => self.handle_enable_admin_mode(),
+
+            // Fake AP (rogue open access point)
+            Message::FakeApSsidChanged(ssid) => self.handle_fake_ap_ssid_changed(ssid),
+            Message::UseTargetSsidForFakeAp => self.handle_use_target_ssid_for_fake_ap(),
+            Message::StartFakeAp => self.handle_start_fake_ap(),
+            Message::StopFakeAp => self.handle_stop_fake_ap(),
+            Message::FakeApStatusChecked(status) => self.handle_fake_ap_status_checked(status),
+            Message::FakeApProgress(progress) => self.handle_fake_ap_progress(progress),
+            Message::PortalToggled(enabled) => self.handle_portal_toggled(enabled),
+            Message::PortalProgress(progress) => self.handle_portal_progress(progress),
 
             // Crack
             Message::HandshakePathChanged(path) => self.handle_handshake_path_changed(path),
@@ -281,6 +320,10 @@ impl BruteforceApp {
         if !state.capture.output_file.is_empty() {
             self.scan_capture_screen.output_file = state.capture.output_file;
         }
+        if !state.capture.fake_ap_ssid.is_empty() {
+            self.scan_capture_screen.fake_ap_ssid = state.capture.fake_ap_ssid;
+        }
+        self.scan_capture_screen.portal_enabled = state.capture.portal_enabled;
         self.scan_capture_screen.handshake_complete = state.capture.handshake_complete;
         if self.scan_capture_screen.handshake_complete {
             self.scan_capture_screen.handshake_progress.m1_received = true;
@@ -331,6 +374,8 @@ impl BruteforceApp {
                 handshake_complete: self.scan_capture_screen.handshake_complete,
                 packets_captured: self.scan_capture_screen.packets_captured,
                 last_saved_capture_path: self.scan_capture_screen.last_saved_capture_path.clone(),
+                fake_ap_ssid: self.scan_capture_screen.fake_ap_ssid.clone(),
+                portal_enabled: self.scan_capture_screen.portal_enabled,
             },
             crack: PersistedCrackState {
                 handshake_path: self.crack_screen.handshake_path.clone(),

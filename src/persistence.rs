@@ -31,6 +31,16 @@ pub struct PersistedCaptureState {
     pub handshake_complete: bool,
     pub packets_captured: u64,
     pub last_saved_capture_path: Option<String>,
+    /// Last used fake AP network name (open, password-less).
+    #[serde(default)]
+    pub fake_ap_ssid: String,
+    /// Whether the captive portal rides along with the fake AP.
+    #[serde(default = "default_portal_enabled")]
+    pub portal_enabled: bool,
+}
+
+fn default_portal_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

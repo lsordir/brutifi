@@ -6,8 +6,8 @@
  */
 
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, pick_list, row, scrollable, text,
-    Column,
+    button, checkbox, column, container, horizontal_rule, horizontal_space, pick_list, row,
+    scrollable, text, text_input, Column,
 };
 use iced::{Element, Length, Theme};
 
@@ -66,6 +66,18 @@ pub struct ScanCaptureScreen {
     // Channel selection for multi-channel networks
     pub available_channels: Vec<String>,
     pub selected_channel: Option<String>,
+
+    // Fake AP (rogue open access point)
+    pub fake_ap_ssid: String,
+    pub fake_ap_active_ssid: Option<String>,
+    pub fake_ap_running: bool,
+    pub fake_ap_busy: bool,
+
+    // Captive portal (rides along with the fake AP)
+    pub portal_enabled: bool,
+    pub portal_running: bool,
+    /// Last submitted codes: (code, validity when a handshake is on file).
+    pub portal_codes: Vec<(String, Option<bool>)>,
 }
 
 impl Default for ScanCaptureScreen {
@@ -87,6 +99,13 @@ impl Default for ScanCaptureScreen {
             last_saved_capture_path: None,
             available_channels: Vec::new(),
             selected_channel: None,
+            fake_ap_ssid: "FreeWiFi".to_string(),
+            fake_ap_active_ssid: None,
+            fake_ap_running: false,
+            fake_ap_busy: false,
+            portal_enabled: true,
+            portal_running: false,
+            portal_codes: Vec::new(),
         }
     }
 }
@@ -609,6 +628,7 @@ impl ScanCaptureScreen {
 
         content = content.push(network_info_block);
         content = content.push(status_block);
+        content = content.push(self.view_fake_ap_block());
 
         if let Some(logs) = logs_block {
             content = content.push(logs);
@@ -627,6 +647,144 @@ impl ScanCaptureScreen {
             .width(Length::FillPortion(3))
             .height(Length::Fill)
             .into()
+    }
+
+    /// Fake AP card: broadcast an open (no password) network clients can join.
+    fn view_fake_ap_block(&self) -> Element<'_, Message> {
+        let running = self.fake_ap_running;
+        let busy = self.fake_ap_busy;
+
+        // SSID input — applies on next start; editing while running is allowed
+        // but does not touch the live network.
+        let ssid_field = text_input("Network name (SSID)", &self.fake_ap_ssid)
+            .on_input(Message::FakeApSsidChanged)
+            .size(13)
+            .style(theme::text_input_style);
+
+        // One-click evil twin: clone the selected target's name.
+        let use_target_btn = self
+            .target_network
+            .as_ref()
+            .map(|n| n.ssid.trim().to_string())
+            .filter(|ssid| !ssid.is_empty())
+            .map(|_| {
+                button(text("Use target SSID").size(11))
+                    .padding([6, 12])
+                    .style(theme::secondary_button_style)
+                    .on_press(Message::UseTargetSsidForFakeAp)
+            });
+
+        let toggle: Element<Message> = if running {
+            let label = if busy { "Stopping…" } else { "Stop Fake AP" };
+            button(text(label).size(12))
+                .padding([8, 16])
+                .style(theme::danger_button_style)
+                .on_press_maybe((!busy).then_some(Message::StopFakeAp))
+                .into()
+        } else {
+            let label = if busy { "Starting…" } else { "Start Fake AP" };
+            let can_start = !busy && !self.fake_ap_ssid.trim().is_empty();
+            button(text(label).size(12))
+                .padding([8, 16])
+                .style(theme::primary_button_style)
+                .on_press_maybe(can_start.then_some(Message::StartFakeAp))
+                .into()
+        };
+
+        let status_line = if running {
+            let ssid = self
+                .fake_ap_active_ssid
+                .clone()
+                .unwrap_or_else(|| self.fake_ap_ssid.clone());
+            components::labeled_value(
+                "Status",
+                &format!("● Broadcasting '{}' — open, no password", ssid),
+                colors::SUCCESS,
+            )
+        } else {
+            components::labeled_value("Status", "○ Not broadcasting", colors::TEXT_DIM)
+        };
+
+        // Captive portal toggle + live status of captured codes.
+        let portal_toggle = checkbox(
+            "Captive portal — ask clients for the network access code",
+            self.portal_enabled,
+        )
+        .on_toggle(Message::PortalToggled)
+        .size(13)
+        .text_size(11);
+
+        let portal_line: Option<Element<Message>> = if self.portal_running {
+            Some(components::labeled_value(
+                "Portal",
+                "● Live on :8080 — intercepting client logins",
+                colors::SUCCESS,
+            ))
+        } else {
+            None
+        };
+
+        let last_code_line: Option<Element<Message>> =
+            self.portal_codes.last().map(|(code, valid)| {
+                let (label, color) = match valid {
+                    Some(true) => (format!("'{}' ✔ verified correct", code), colors::SUCCESS),
+                    Some(false) => (format!("'{}' ✘ rejected", code), colors::DANGER),
+                    None => (format!("'{}' (unverified)", code), colors::TEXT),
+                };
+                components::labeled_value(
+                    "Codes",
+                    &format!("{} captured — last: {}", self.portal_codes.len(), label),
+                    color,
+                )
+            });
+
+        let hint = if running {
+            components::callout(
+                colors::WARNING,
+                "Hosting an open network",
+                &[
+                    "Anyone nearby can connect — stop it when you are done testing.",
+                    "'Stop Fake AP' disables sharing and restores the previous computer name.",
+                ],
+            )
+        } else {
+            components::callout(
+                colors::SECONDARY,
+                "Open, password-less test network",
+                &[
+                    "Broadcasts through macOS Internet Sharing — clients connect without a password.",
+                    "Needs an uplink other than Wi-Fi (Ethernet or USB adapter); Wi-Fi hosts the network.",
+                    "The Mac's computer name is used as the network name and restored on stop.",
+                ],
+            )
+        };
+
+        let mut controls_row = row![].spacing(8).align_y(iced::Alignment::Center);
+        controls_row = controls_row.push(container(ssid_field).width(Length::Fill));
+        if let Some(btn) = use_target_btn {
+            controls_row = controls_row.push(btn);
+        }
+        controls_row = controls_row.push(toggle);
+
+        let mut body = column![
+            components::section_title("Fake Access Point"),
+            text("Spin up a rogue open network clients can join freely — no password.")
+                .size(11)
+                .color(colors::TEXT_DIM),
+            controls_row,
+            status_line,
+            portal_toggle,
+        ]
+        .spacing(8);
+        if let Some(portal_line) = portal_line {
+            body = body.push(portal_line);
+        }
+        if let Some(last_code_line) = last_code_line {
+            body = body.push(last_code_line);
+        }
+        body = body.push(hint);
+
+        components::card(body)
     }
 }
 

@@ -469,3 +469,140 @@ pub async fn crack_hashcat_async(
         Err(e) => CrackProgress::Error(format!("Task failed: {}", e)),
     }
 }
+
+/// Fake AP (rogue open access point) progress from background worker
+#[derive(Debug, Clone)]
+pub enum FakeApProgress {
+    Log(String),
+    Started { ssid: String },
+    Stopped,
+    Error(String),
+}
+
+/// Start broadcasting the open fake AP in the background.
+pub async fn fake_ap_start_async(
+    ssid: String,
+    progress_tx: tokio::sync::mpsc::UnboundedSender<FakeApProgress>,
+) -> FakeApProgress {
+    let _ = progress_tx.send(FakeApProgress::Log(format!(
+        "📡 Spinning up open fake AP '{}'…",
+        ssid
+    )));
+
+    let ssid_for_task = ssid.clone();
+    let result = tokio::task::spawn_blocking(move || brutifi::start_fake_ap(&ssid_for_task)).await;
+
+    match result {
+        Ok(Ok(())) => {
+            let _ = progress_tx.send(FakeApProgress::Log(
+                "✅ Fake AP is broadcasting (open — no password)".to_string(),
+            ));
+            FakeApProgress::Started { ssid }
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let _ = progress_tx.send(FakeApProgress::Log(format!("❌ Fake AP failed: {}", msg)));
+            FakeApProgress::Error(msg)
+        }
+        Err(e) => {
+            let msg = format!("Task failed: {}", e);
+            let _ = progress_tx.send(FakeApProgress::Log(msg.clone()));
+            FakeApProgress::Error(msg)
+        }
+    }
+}
+
+/// Stop the fake AP and restore the previous configuration.
+pub async fn fake_ap_stop_async(
+    progress_tx: tokio::sync::mpsc::UnboundedSender<FakeApProgress>,
+) -> FakeApProgress {
+    let _ = progress_tx.send(FakeApProgress::Log("⏹ Stopping fake AP…".to_string()));
+
+    let result = tokio::task::spawn_blocking(brutifi::stop_fake_ap).await;
+
+    match result {
+        Ok(Ok(())) => {
+            let _ = progress_tx.send(FakeApProgress::Log(
+                "✓ Previous network name and sharing settings restored".to_string(),
+            ));
+            FakeApProgress::Stopped
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let _ = progress_tx.send(FakeApProgress::Log(format!("❌ Stop failed: {}", msg)));
+            FakeApProgress::Error(msg)
+        }
+        Err(e) => FakeApProgress::Error(format!("Task failed: {}", e)),
+    }
+}
+
+/// Check whether a fake AP is currently broadcasting (used at startup).
+pub async fn fake_ap_status_async() -> brutifi::FakeApStatus {
+    tokio::task::spawn_blocking(brutifi::fake_ap_status)
+        .await
+        .unwrap_or(brutifi::FakeApStatus::Down)
+}
+
+/// Captive portal progress from background worker
+#[derive(Debug, Clone)]
+pub enum PortalProgress {
+    Started {
+        port: u16,
+        redirect_active: bool,
+        verifying: bool,
+    },
+    Log(String),
+    Code {
+        code: String,
+        valid: Option<bool>,
+    },
+    Stopped,
+    Error(String),
+}
+
+/// Run the captive portal in the background until `state` is stopped.
+pub async fn portal_async(
+    config: brutifi::PortalConfig,
+    state: std::sync::Arc<brutifi::PortalState>,
+    progress_tx: tokio::sync::mpsc::UnboundedSender<PortalProgress>,
+) -> PortalProgress {
+    let tx = progress_tx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        brutifi::run_portal(config, state, move |event: brutifi::PortalEvent| {
+            let progress = match event {
+                brutifi::PortalEvent::Started {
+                    port,
+                    redirect_active,
+                    verifying,
+                } => PortalProgress::Started {
+                    port,
+                    redirect_active,
+                    verifying,
+                },
+                brutifi::PortalEvent::Log(msg) => PortalProgress::Log(msg),
+                brutifi::PortalEvent::Code { code, valid } => PortalProgress::Code { code, valid },
+                brutifi::PortalEvent::Error(msg) => PortalProgress::Error(msg),
+            };
+            let _ = tx.send(progress);
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            let _ = progress_tx.send(PortalProgress::Log(
+                "✓ Captive portal closed cleanly".to_string(),
+            ));
+            PortalProgress::Stopped
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let _ = progress_tx.send(PortalProgress::Log(format!(
+                "❌ Captive portal error: {}",
+                msg
+            )));
+            PortalProgress::Error(msg)
+        }
+        Err(e) => PortalProgress::Error(format!("Task failed: {}", e)),
+    }
+}

@@ -6,6 +6,8 @@ pub mod hashcat;
 pub mod network;
 pub mod passive_pmkid;
 pub mod password_gen;
+pub mod portal;
+pub mod rogue_ap;
 pub mod security;
 pub mod session;
 
@@ -26,6 +28,8 @@ pub use passive_pmkid::{
     save_captured_pmkids, CapturedPmkid, PassivePmkidConfig, PassivePmkidProgress,
     PassivePmkidResult, PassivePmkidState,
 };
+pub use portal::{run_portal, PortalConfig, PortalEvent, PortalState};
+pub use rogue_ap::{fake_ap_status, start_fake_ap, stop_fake_ap, FakeApStatus};
 pub use session::{
     AttackType, SessionConfig, SessionData, SessionManager, SessionMetadata, SessionProgress,
     SessionStatus,

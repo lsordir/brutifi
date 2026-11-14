@@ -6,6 +6,7 @@
 
 mod capture;
 mod crack;
+mod fake_ap;
 mod general;
 mod navigation;
 mod scan;
