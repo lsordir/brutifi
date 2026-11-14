@@ -583,7 +583,7 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     println!("{}", "🟢 Capturing... (Press Ctrl+C to stop)");
 
     let start = std::time::Instant::now();
-    let mut packets_count = 0;
+    let mut packets_count: u64 = 0;
 
     // Channel rotation state
     let mut current_channel_idx = 0;
@@ -859,13 +859,9 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
                     }
                 }
 
-                if packets_count % 50 == 0 {
+                if packets_count.is_multiple_of(50) {
                     let elapsed = start.elapsed().as_secs();
-                    let rate = if elapsed > 0 {
-                        packets_count / elapsed
-                    } else {
-                        0
-                    };
+                    let rate = packets_count.checked_div(elapsed).unwrap_or(0);
                     print!(
                         "\r📦 Packets: {} | Rate: {}/s | M1s: {} | Elapsed: {}s   ",
                         packets_count,
@@ -1247,7 +1243,7 @@ fn detect_all_channels_for_ssid(ssid: &str) -> Vec<NetworkInfo> {
         // Return results found by swift
         if !results.is_empty() {
             // Sort by RSSI
-            results.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+            results.sort_by_key(|net| std::cmp::Reverse(net.rssi));
             // Log
             for net in &results {
                 println!(
