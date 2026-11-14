@@ -48,35 +48,10 @@ impl BruteforceApp {
             self.persist_state();
         }
 
-        if self.is_root {
-            let mut envs = Vec::new();
-            envs.push(("BRUTIFI_START_SCREEN", "crack".to_string()));
-            if !self.scan_capture_screen.output_file.is_empty() {
-                envs.push((
-                    "BRUTIFI_HANDSHAKE_PATH",
-                    self.scan_capture_screen.output_file.clone(),
-                ));
-            }
-            if let Some(ref network) = self.scan_capture_screen.target_network {
-                if !network.ssid.is_empty() {
-                    envs.push(("BRUTIFI_SSID", network.ssid.clone()));
-                }
-            }
-            if !self.crack_screen.wordlist_path.is_empty() {
-                envs.push((
-                    "BRUTIFI_WORDLIST_PATH",
-                    self.crack_screen.wordlist_path.clone(),
-                ));
-            }
-
-            if crate::relaunch_as_user(&envs) {
-                std::process::exit(0);
-            }
-
-            self.crack_screen.error_message = Some(
-                "Failed to return to normal mode. Please restart the app manually.".to_string(),
-            );
-        }
+        // Note: we intentionally stay in the same process here. Previously the
+        // app relaunched itself as the normal user (dropping root) and exited,
+        // which closed the window and lost the captured result. Cracking does
+        // not need root, so we simply navigate in-process.
 
         // Set handshake path from capture
         if let Some(ref saved) = self.scan_capture_screen.last_saved_capture_path {

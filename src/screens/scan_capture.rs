@@ -157,6 +157,7 @@ impl ScanCaptureScreen {
                 Message::InterfaceSelected,
             )
             .placeholder("Select interface")
+            .style(theme::pick_list_style)
             .into()
         };
 
@@ -170,15 +171,10 @@ impl ScanCaptureScreen {
         // Network list
         let network_list: Element<Message> = if self.networks.is_empty() {
             if self.is_scanning {
-                container(text("Scanning...").size(13).color(colors::TEXT_DIM))
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .into()
-            } else {
                 container(
                     column![
-                        text("No networks").size(14).color(colors::TEXT_DIM),
-                        text("Click Scan to discover WiFi networks")
+                        text("Scanning the airwaves…").size(14).color(colors::TEXT),
+                        text("Discovering nearby WiFi networks")
                             .size(11)
                             .color(colors::TEXT_DIM),
                     ]
@@ -188,45 +184,82 @@ impl ScanCaptureScreen {
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
+            } else {
+                container(
+                    column![
+                        text("No networks yet").size(15).color(colors::TEXT),
+                        text("Click Scan to discover nearby WiFi networks")
+                            .size(11)
+                            .color(colors::TEXT_DIM),
+                    ]
+                    .spacing(6)
+                    .align_x(iced::Alignment::Center),
+                )
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
             }
         } else {
-            let items: Vec<Element<Message>> = self
-                .networks
+            // Column header (table-style)
+            let col_header = row![
+                text("NETWORK")
+                    .size(10)
+                    .color(colors::TEXT_FAINT)
+                    .width(Length::Fill),
+                text("CH")
+                    .size(10)
+                    .color(colors::TEXT_FAINT)
+                    .width(Length::Fixed(36.0)),
+                text("SIGNAL")
+                    .size(10)
+                    .color(colors::TEXT_FAINT)
+                    .width(Length::Fixed(92.0)),
+                text("SECURITY")
+                    .size(10)
+                    .color(colors::TEXT_FAINT)
+                    .width(Length::Fixed(88.0)),
+            ]
+            .spacing(10)
+            .padding([2, 12]);
+
+            // Sort display order by signal strength (strongest first), keeping
+            // the original indices for selection.
+            let mut order: Vec<usize> = (0..self.networks.len()).collect();
+            order.sort_by(|&a, &b| {
+                let ra = self.networks[a]
+                    .signal_strength
+                    .parse::<i32>()
+                    .unwrap_or(i32::MIN);
+                let rb = self.networks[b]
+                    .signal_strength
+                    .parse::<i32>()
+                    .unwrap_or(i32::MIN);
+                rb.cmp(&ra)
+            });
+
+            let items: Vec<Element<Message>> = order
                 .iter()
-                .enumerate()
-                .map(|(idx, network)| {
+                .map(|&idx| {
+                    let network = &self.networks[idx];
                     let is_selected = self.selected_network == Some(idx);
+                    let rssi = network.signal_strength.parse::<i32>().ok();
 
-                    let security_color = if network.security.contains("WPA3") {
-                        colors::DANGER
-                    } else if network.security.contains("WPA") {
-                        colors::PRIMARY
-                    } else if network.security.contains("None") {
-                        colors::SUCCESS
-                    } else {
-                        colors::TEXT_DIM
-                    };
-
-                    let signal_icon = if let Ok(rssi) = network.signal_strength.parse::<i32>() {
-                        if rssi > -50 {
-                            "Strong"
-                        } else if rssi > -70 {
-                            "Medium"
-                        } else {
-                            "Weak"
-                        }
-                    } else {
-                        "?"
-                    };
-
-                    // Detect attack methods based on security type
+                    // Attack methods available for this network.
                     let attack_methods: Vec<&str> = if network.security.contains("WPA") {
                         vec!["PMKID", "Handshake"]
-                    } else if network.security.contains("None") {
-                        vec!["Open"]
                     } else {
-                        vec![]
+                        vec!["Open"]
                     };
+                    let badges = row(attack_methods
+                        .iter()
+                        .map(|m| {
+                            container(text(*m).size(8).color(colors::ACCENT))
+                                .padding([1, 6])
+                                .style(theme::badge_style(colors::ACCENT))
+                                .into()
+                        })
+                        .collect::<Vec<Element<Message>>>())
+                    .spacing(4);
 
                     let item_style = if is_selected {
                         theme::network_item_selected_style
@@ -234,55 +267,39 @@ impl ScanCaptureScreen {
                         theme::network_item_style
                     };
 
+                    let ssid_label = if network.ssid.trim().is_empty() {
+                        "<hidden>".to_string()
+                    } else {
+                        network.ssid.clone()
+                    };
+
                     button(
                         container(
                             row![
                                 column![
-                                    text(network.ssid.clone()).size(13).color(if is_selected {
-                                        colors::SUCCESS
+                                    text(ssid_label).size(13).color(if is_selected {
+                                        colors::ACCENT
                                     } else {
                                         colors::TEXT
                                     }),
-                                    text(format!("Ch {} | {}", network.channel, signal_icon))
-                                        .size(10)
-                                        .color(colors::TEXT_DIM),
-                                    if !attack_methods.is_empty() {
-                                        row(attack_methods
-                                            .iter()
-                                            .map(|method| {
-                                                container(
-                                                    text(*method).size(8).color(iced::Color::WHITE),
-                                                )
-                                                .padding([2, 5])
-                                                .style(|_: &Theme| container::Style {
-                                                    background: Some(iced::Background::Color(
-                                                        iced::Color::from_rgba(
-                                                            0.18, 0.55, 0.34, 0.2,
-                                                        ),
-                                                    )),
-                                                    border: iced::Border {
-                                                        color: colors::PRIMARY,
-                                                        width: 1.0,
-                                                        radius: 3.0.into(),
-                                                    },
-                                                    ..Default::default()
-                                                })
-                                                .into()
-                                            })
-                                            .collect::<Vec<Element<Message>>>())
-                                        .spacing(3)
-                                    } else {
-                                        row![].spacing(0)
-                                    },
+                                    text(network.bssid.clone())
+                                        .size(9)
+                                        .color(colors::TEXT_FAINT),
+                                    badges,
                                 ]
-                                .spacing(3),
-                                horizontal_space(),
-                                text(network.security.clone())
-                                    .size(10)
-                                    .color(security_color),
+                                .spacing(3)
+                                .width(Length::Fill),
+                                text(network.channel.clone())
+                                    .size(12)
+                                    .color(colors::TEXT_DIM)
+                                    .width(Length::Fixed(36.0)),
+                                container(signal_cell(rssi)).width(Length::Fixed(92.0)),
+                                container(security_badge(&network.security))
+                                    .width(Length::Fixed(88.0)),
                             ]
                             .align_y(iced::Alignment::Center)
-                            .padding(8),
+                            .spacing(10)
+                            .padding([8, 12]),
                         )
                         .style(item_style),
                     )
@@ -296,16 +313,24 @@ impl ScanCaptureScreen {
                 })
                 .collect();
 
-            scrollable(Column::with_children(items).spacing(4).width(Length::Fill))
-                .height(Length::Fill)
-                .into()
+            column![
+                col_header,
+                horizontal_rule(1),
+                scrollable(Column::with_children(items).spacing(6).width(Length::Fill))
+                    .height(Length::Fill),
+            ]
+            .spacing(8)
+            .into()
         };
 
         let network_count = if !self.networks.is_empty() {
             Some(
-                text(format!("{} networks", self.networks.len()))
-                    .size(11)
-                    .color(colors::TEXT_DIM),
+                text(format!(
+                    "{} networks found · sorted by signal",
+                    self.networks.len()
+                ))
+                .size(11)
+                .color(colors::TEXT_DIM),
             )
         } else {
             None
@@ -384,6 +409,7 @@ impl ScanCaptureScreen {
                         Message::SelectChannel,
                     )
                     .placeholder("Choose channel...")
+                    .style(theme::pick_list_style)
                     .width(Length::Fill)
                     .into(),
                 );
@@ -451,19 +477,9 @@ impl ScanCaptureScreen {
                 ]
                 .spacing(6),
             )
-            .padding(12)
+            .padding(14)
             .width(Length::Fill)
-            .style(|_: &Theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.18, 0.80, 0.44, 0.15,
-                ))),
-                border: iced::Border {
-                    color: colors::SUCCESS,
-                    width: 2.0,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            })
+            .style(theme::callout_style(colors::SUCCESS))
             .into()
         } else if self.is_capturing {
             // Capturing state
@@ -499,6 +515,9 @@ impl ScanCaptureScreen {
                         ]
                         .spacing(12)
                     },
+                    text("No client reconnecting? Press 'Send Deauth' to force a reconnect.")
+                        .size(10)
+                        .color(colors::TEXT_DIM),
                 ]
                 .spacing(6),
             )
@@ -530,9 +549,14 @@ impl ScanCaptureScreen {
                     column![
                         text("Logs").size(13).color(colors::TEXT),
                         scrollable(
-                            container(text(self.log_messages.join("\n")).size(11))
-                                .padding(8)
-                                .width(Length::Fill)
+                            container(
+                                text(self.log_messages.join("\n"))
+                                    .size(11)
+                                    .color(colors::TEXT_DIM)
+                            )
+                            .padding(10)
+                            .width(Length::Fill)
+                            .style(theme::panel_style)
                         )
                         .height(Length::Fixed(150.0))
                     ]
@@ -551,17 +575,7 @@ impl ScanCaptureScreen {
             container(text(msg).size(11).color(colors::DANGER))
                 .padding(12)
                 .width(Length::Fill)
-                .style(|_: &Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.86, 0.21, 0.27, 0.15,
-                    ))),
-                    border: iced::Border {
-                        color: colors::DANGER,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                })
+                .style(theme::callout_style(colors::DANGER))
                 .into()
         });
 
@@ -595,6 +609,15 @@ impl ScanCaptureScreen {
                         .into(),
                 );
             } else if self.is_capturing {
+                // Send Deauth: force connected clients to reconnect so a fresh
+                // handshake can be captured.
+                buttons_vec.push(
+                    button(text("Send Deauth").size(12))
+                        .padding([8, 16])
+                        .style(theme::primary_button_style)
+                        .on_press(Message::SendDeauth)
+                        .into(),
+                );
                 // Show Stop button
                 buttons_vec.push(
                     button(text("Stop Capture").size(12))
@@ -651,19 +674,9 @@ impl ScanCaptureScreen {
                     ]
                     .spacing(4),
                 )
-                .padding(10)
+                .padding(12)
                 .width(Length::Fill)
-                .style(|_: &Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.2, 0.6, 0.86, 0.1,
-                    ))),
-                    border: iced::Border {
-                        color: iced::Color::from_rgb(0.4, 0.7, 0.9),
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }),
+                .style(theme::callout_style(colors::SECONDARY)),
             );
         }
 
@@ -688,4 +701,90 @@ impl ScanCaptureScreen {
             .height(Length::Fill)
             .into()
     }
+}
+
+/// Render a compact 4-bar signal meter plus the dBm value, colored by strength.
+fn signal_cell(rssi: Option<i32>) -> Element<'static, Message> {
+    let (active_bars, color, label) = match rssi {
+        Some(r) => {
+            let bars = if r >= -55 {
+                4
+            } else if r >= -67 {
+                3
+            } else if r >= -78 {
+                2
+            } else {
+                1
+            };
+            let color = if r >= -55 {
+                colors::SUCCESS
+            } else if r >= -67 {
+                colors::PRIMARY
+            } else if r >= -78 {
+                colors::WARNING
+            } else {
+                colors::DANGER
+            };
+            (bars, color, format!("{} dBm", r))
+        }
+        None => (0, colors::TEXT_FAINT, "—".to_string()),
+    };
+
+    let heights = [6.0_f32, 9.0, 12.0, 15.0];
+    let bars = row((0..4)
+        .map(|i| {
+            let on = (i as i32) < active_bars;
+            container(text(""))
+                .width(Length::Fixed(4.0))
+                .height(Length::Fixed(heights[i]))
+                .style(move |_: &Theme| container::Style {
+                    background: Some(iced::Background::Color(if on {
+                        color
+                    } else {
+                        colors::BORDER_STRONG
+                    })),
+                    border: iced::Border {
+                        radius: 1.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .into()
+        })
+        .collect::<Vec<Element<Message>>>())
+    .spacing(2)
+    .align_y(iced::Alignment::End);
+
+    row![
+        container(bars).height(Length::Fixed(16.0)),
+        text(label).size(9).color(color),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// Render a rounded security badge, colored by protocol.
+fn security_badge(security: &str) -> Element<'static, Message> {
+    let is_open = security.is_empty()
+        || security.eq_ignore_ascii_case("none")
+        || security.to_lowercase().contains("open");
+    let color = if security.contains("WPA3") {
+        colors::SECONDARY
+    } else if security.contains("WPA") {
+        colors::PRIMARY
+    } else if is_open {
+        colors::SUCCESS
+    } else {
+        colors::TEXT_DIM
+    };
+    let label = if is_open {
+        "Open".to_string()
+    } else {
+        security.to_string()
+    };
+    container(text(label).size(9).color(color))
+        .padding([3, 8])
+        .style(theme::badge_style(color))
+        .into()
 }

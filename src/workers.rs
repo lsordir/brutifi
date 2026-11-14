@@ -43,6 +43,10 @@ pub enum CrackProgress {
 pub struct CaptureState {
     pub running: Arc<AtomicBool>,
     pub packets_count: Arc<AtomicU64>,
+    /// Set to `true` by the UI to request a one-shot deauth burst against the
+    /// target AP. The capture engine consumes (clears) the flag each time it
+    /// sends a burst.
+    pub deauth_requested: Arc<AtomicBool>,
 }
 
 impl CaptureState {
@@ -50,11 +54,17 @@ impl CaptureState {
         Self {
             running: Arc::new(AtomicBool::new(true)),
             packets_count: Arc::new(AtomicU64::new(0)),
+            deauth_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Request a one-shot targeted deauth burst against the current AP.
+    pub fn request_deauth(&self) {
+        self.deauth_requested.store(true, Ordering::SeqCst);
     }
 }
 
@@ -205,6 +215,7 @@ pub async fn capture_async(
 
     // Run capture in blocking thread
     let running_clone = state.running.clone();
+    let deauth_clone = state.deauth_requested.clone();
     let result = tokio::task::spawn_blocking(move || {
         // Build capture options inside the blocking thread
         let options = CaptureOptions {
@@ -213,9 +224,15 @@ pub async fn capture_async(
             ssid: ssid.as_deref(),
             bssid: None,
             output_file: &params.output_file,
-            duration: None,  // Run until stopped
-            no_deauth: true, // macOS doesn't support packet injection
+            duration: None, // Run until stopped
+            // Automatic deauth is ON: once the target AP is identified, the engine
+            // sends periodic targeted deauth bursts to force clients to reconnect
+            // so a handshake can be captured. It stops as soon as capture ends
+            // (capture auto-stops on a complete handshake). The "Send Deauth"
+            // button still triggers extra on-demand bursts via `deauth_requested`.
+            no_deauth: false,
             running: Some(running_clone), // Pass the state for stopping
+            deauth_requested: Some(deauth_clone), // User-triggered deauth bursts
         };
 
         // Try to capture, with better error messages

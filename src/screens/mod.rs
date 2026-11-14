@@ -9,5 +9,7 @@
 pub mod crack;
 pub mod scan_capture;
 
-pub use crack::{CrackEngine, CrackMethod, CrackScreen};
+pub use crack::{
+    default_wordlist_path, CrackEngine, CrackMethod, CrackScreen, DEFAULT_WORDLIST_URL,
+};
 pub use scan_capture::{HandshakeProgress, ScanCaptureScreen};

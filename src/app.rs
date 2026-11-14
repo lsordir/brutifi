@@ -148,6 +148,7 @@ impl BruteforceApp {
             Message::WifiDisconnectResult(result) => self.handle_wifi_disconnect_result(result),
             Message::StartCapture => self.handle_start_capture(),
             Message::StopCapture => self.handle_stop_capture(),
+            Message::SendDeauth => self.handle_send_deauth(),
             Message::CaptureProgress(progress) => self.handle_capture_progress(progress),
             Message::EnableAdminMode => self.handle_enable_admin_mode(),
 
@@ -162,6 +163,10 @@ impl BruteforceApp {
             Message::BrowseWordlist => self.handle_browse_wordlist(),
             Message::HandshakeSelected(path) => self.handle_handshake_selected(path),
             Message::WordlistSelected(path) => self.handle_wordlist_selected(path),
+            Message::DownloadDefaultWordlist => self.handle_download_default_wordlist(),
+            Message::WordlistDownloadComplete(result) => {
+                self.handle_wordlist_download_complete(result)
+            }
             Message::StartCrack => self.handle_start_crack(),
             Message::StopCrack => self.handle_stop_crack(),
             Message::CrackProgress(progress) => self.handle_crack_progress(progress),
@@ -173,52 +178,72 @@ impl BruteforceApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        // Root warning banner
-        let root_warning = if !self.is_root {
-            Some(
-                container(
-                    row![
-                        text("ℹ ").size(14).color(colors::TEXT_DIM),
-                        text("Capture requires root. Crack works without permissions.")
-                            .size(12)
-                            .color(colors::TEXT_DIM),
-                    ]
-                    .align_y(iced::Alignment::Center)
-                    .padding([6, 15]),
-                )
-                .width(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.5, 0.5, 0.5, 0.1,
-                    ))),
+        // --- Brand / logo block ---
+        let brand = row![
+            container(text("B").size(22).color(colors::BACKGROUND))
+                .padding([2, 12])
+                .style(|_: &Theme| container::Style {
+                    background: Some(iced::Background::Color(colors::PRIMARY)),
                     border: iced::Border {
-                        color: colors::TEXT_DIM,
-                        width: 1.0,
+                        radius: 10.0.into(),
                         ..Default::default()
                     },
                     ..Default::default()
                 }),
-            )
-        } else {
-            None
-        };
-
-        // Navigation header - 2 tabs
-        let nav = container(
-            row![
-                nav_button("1. Scan & Capture", Screen::ScanCapture, self.screen),
-                text("→").size(16).color(colors::TEXT_DIM),
-                nav_button("2. Crack", Screen::Crack, self.screen),
+            column![
+                text("BrutiFi").size(19).color(colors::TEXT),
+                text("WPA / WPA2 Security Auditor")
+                    .size(11)
+                    .color(colors::TEXT_DIM),
             ]
-            .spacing(15)
+            .spacing(1),
+        ]
+        .spacing(11)
+        .align_y(iced::Alignment::Center);
+
+        // --- Privilege status chip ---
+        let (chip_label, chip_color) = if self.is_root {
+            ("● Admin mode", colors::SUCCESS)
+        } else {
+            ("● Limited (crack only)", colors::WARNING)
+        };
+        let status_chip = container(text(chip_label).size(11).color(chip_color))
+            .padding([5, 12])
+            .style(crate::theme::badge_style(chip_color));
+
+        // --- Segmented navigation ---
+        let nav = row![
+            nav_button("Scan & Capture", "1", Screen::ScanCapture, self.screen),
+            nav_button("Crack", "2", Screen::Crack, self.screen),
+        ]
+        .spacing(6);
+
+        let nav_segment = container(nav)
+            .padding(4)
+            .style(|_: &Theme| container::Style {
+                background: Some(iced::Background::Color(colors::BACKGROUND)),
+                border: iced::Border {
+                    color: colors::BORDER,
+                    width: 1.0,
+                    radius: 11.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // --- Header bar ---
+        let header = container(
+            row![
+                brand,
+                iced::widget::horizontal_space(),
+                nav_segment,
+                iced::widget::horizontal_space().width(16),
+                status_chip,
+            ]
             .align_y(iced::Alignment::Center)
-            .padding([10, 20]),
+            .padding([12, 20]),
         )
         .width(Length::Fill)
-        .style(|_| container::Style {
-            background: Some(iced::Background::Color(colors::SURFACE)),
-            ..Default::default()
-        });
+        .style(crate::theme::header_style);
 
         // Current screen content
         let content = match self.screen {
@@ -226,13 +251,14 @@ impl BruteforceApp {
             Screen::Crack => self.crack_screen.view(self.is_root),
         };
 
-        let mut main_col = column![nav, horizontal_rule(1)];
-        if let Some(warning) = root_warning {
-            main_col = main_col.push(warning);
-        }
-        main_col = main_col.push(content);
+        let main_col = column![header, horizontal_rule(1), content];
 
-        main_col.into()
+        container(main_col)
+            .style(|_: &Theme| container::Style {
+                background: Some(iced::Background::Color(colors::BACKGROUND)),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn apply_persisted_state(&mut self, state: PersistedState) {
@@ -395,37 +421,56 @@ fn save_persisted_state(state: &PersistedState) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Navigation button helper
-fn nav_button(label: &str, target: Screen, current: Screen) -> Element<'_, Message> {
+/// Segmented-control navigation tab.
+fn nav_button<'a>(
+    label: &'a str,
+    number: &'a str,
+    target: Screen,
+    current: Screen,
+) -> Element<'a, Message> {
     let is_active = target == current;
-    let color = if is_active {
-        colors::PRIMARY
-    } else {
-        colors::TEXT_DIM
-    };
 
     let msg = match target {
         Screen::ScanCapture => Message::GoToScanCapture,
         Screen::Crack => Message::GoToCrack,
     };
 
-    button(text(label).size(14).color(color))
-        .padding([8, 12])
+    let num_color = if is_active {
+        colors::BACKGROUND
+    } else {
+        colors::TEXT_FAINT
+    };
+    let text_color = if is_active {
+        colors::BACKGROUND
+    } else {
+        colors::TEXT_DIM
+    };
+
+    let inner = row![
+        text(number).size(12).color(num_color),
+        text(label).size(13).color(text_color),
+    ]
+    .spacing(7)
+    .align_y(iced::Alignment::Center);
+
+    button(inner)
+        .padding([8, 16])
         .style(move |_, status| {
-            let bg = match status {
-                iced::widget::button::Status::Hovered => {
-                    Some(iced::Background::Color(colors::SURFACE_HOVER))
+            let bg = if is_active {
+                Some(iced::Background::Color(colors::PRIMARY))
+            } else {
+                match status {
+                    iced::widget::button::Status::Hovered => {
+                        Some(iced::Background::Color(colors::SURFACE_HOVER))
+                    }
+                    _ => None,
                 }
-                _ if is_active => Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.18, 0.55, 0.34, 0.2,
-                ))),
-                _ => None,
             };
             iced::widget::button::Style {
                 background: bg,
-                text_color: color,
+                text_color,
                 border: iced::Border {
-                    radius: 4.0.into(),
+                    radius: 8.0.into(),
                     ..Default::default()
                 },
                 ..Default::default()

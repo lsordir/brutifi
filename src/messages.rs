@@ -33,6 +33,7 @@ pub enum Message {
     WifiDisconnectResult(Result<(), String>),
     StartCapture,
     StopCapture,
+    SendDeauth,
     CaptureProgress(CaptureProgress),
     #[allow(dead_code)]
     EnableAdminMode,
@@ -48,6 +49,8 @@ pub enum Message {
     BrowseWordlist,
     HandshakeSelected(Option<PathBuf>),
     WordlistSelected(Option<PathBuf>),
+    DownloadDefaultWordlist,
+    WordlistDownloadComplete(Result<String, String>),
     StartCrack,
     StopCrack,
     CrackProgress(CrackProgress),

@@ -21,8 +21,6 @@ use app::BruteforceApp;
 use iced::window;
 use iced::Size;
 use std::env;
-use std::ffi::CString;
-use std::os::unix::process::CommandExt;
 use std::panic;
 use std::process::Command;
 
@@ -96,43 +94,6 @@ pub(crate) fn relaunch_as_root_with_env(envs: &[(&'static str, String)]) -> bool
 
 pub(crate) fn relaunch_as_root() -> bool {
     relaunch_as_root_with_env(&[])
-}
-
-fn user_ids(username: &str) -> Option<(u32, u32)> {
-    let cstr = CString::new(username).ok()?;
-    unsafe {
-        let pwd = libc::getpwnam(cstr.as_ptr());
-        if pwd.is_null() {
-            return None;
-        }
-        let uid = (*pwd).pw_uid;
-        let gid = (*pwd).pw_gid;
-        Some((uid, gid))
-    }
-}
-
-pub(crate) fn relaunch_as_user(envs: &[(&'static str, String)]) -> bool {
-    let exe = match env::current_exe() {
-        Ok(path) => path,
-        Err(_) => return false,
-    };
-
-    let user = env::var("USER").unwrap_or_else(|_| "".to_string());
-    if user.is_empty() {
-        return false;
-    }
-
-    let (uid, gid) = match user_ids(&user) {
-        Some(ids) => ids,
-        None => return false,
-    };
-
-    let mut cmd = Command::new(exe);
-    for (k, v) in envs {
-        cmd.env(*k, v);
-    }
-
-    cmd.uid(uid).gid(gid).spawn().map(|_| true).unwrap_or(false)
 }
 
 /// Setup panic handler to show errors instead of silent exit

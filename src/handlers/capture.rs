@@ -226,6 +226,27 @@ impl BruteforceApp {
         )
     }
 
+    /// Send a user-triggered deauth burst to force clients to reconnect.
+    pub fn handle_send_deauth(&mut self) -> Task<Message> {
+        if let Some(ref state) = self.capture_state {
+            if self.scan_capture_screen.is_capturing {
+                state.request_deauth();
+                self.add_capture_log(
+                    "📣 Deauth burst requested — forcing connected clients to reconnect…"
+                        .to_string(),
+                );
+                self.add_capture_log(
+                    "ℹ️  On Apple Silicon Macs, injection often fails; if nothing reconnects, toggle the device's WiFi off/on manually.".to_string(),
+                );
+            } else {
+                self.add_capture_log("⚠️ Start a capture first, then send a deauth.".to_string());
+            }
+        } else {
+            self.add_capture_log("⚠️ No active capture — start capture before deauth.".to_string());
+        }
+        Task::none()
+    }
+
     /// Stop packet capture
     pub fn handle_stop_capture(&mut self) -> Task<Message> {
         if let Some(ref state) = self.capture_state {
@@ -267,14 +288,19 @@ impl BruteforceApp {
 
                 let capture_type = self.scan_capture_screen.handshake_progress.capture_type();
                 self.add_capture_log(format!("✅ {} captured for '{}'", capture_type, ssid));
-                self.persist_state();
 
-                if self.is_root {
-                    let envs = self.build_relaunch_envs_for_capture(false);
-                    if crate::relaunch_as_user(&envs) {
-                        std::process::exit(0);
-                    }
+                // Wire the captured file straight into the Crack screen so the
+                // user can proceed without re-selecting it. The app stays in the
+                // same process — no privilege-drop relaunch, which previously made
+                // the window vanish (looked like a crash) after capture.
+                if !self.scan_capture_screen.output_file.is_empty() {
+                    self.crack_screen.handshake_path = self.scan_capture_screen.output_file.clone();
                 }
+                self.crack_screen.ssid = ssid.clone();
+                self.add_capture_log(
+                    "➡️  Ready to crack — open the Crack tab to start.".to_string(),
+                );
+                self.persist_state();
             }
             CaptureProgress::Error(msg) => {
                 self.scan_capture_screen.error_message = Some(msg.clone());

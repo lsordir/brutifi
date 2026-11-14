@@ -14,6 +14,25 @@ use iced::{Element, Length};
 use crate::messages::Message;
 use crate::theme::{self, colors};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Path to the bundled default wordlist cache (`~/.brutifi/wordlists/rockyou.txt`).
+pub fn default_wordlist_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(
+        PathBuf::from(home)
+            .join(".brutifi")
+            .join("wordlists")
+            .join("rockyou.txt"),
+    )
+}
+
+/// Reputable mirror of the standard rockyou.txt WPA/WPA2 wordlist (~134 MB).
+pub const DEFAULT_WORDLIST_URL: &str =
+    "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt";
 
 /// Cracking engine selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -72,12 +91,23 @@ pub struct CrackScreen {
     pub log_messages: Vec<String>,
     pub hashcat_available: bool,
     pub hcxtools_available: bool,
+    pub is_downloading_wordlist: bool,
+    pub wordlist_status: Option<String>,
 }
 
 impl Default for CrackScreen {
     fn default() -> Self {
         // Check external tools availability
         let (hcxtools, hashcat) = brutifi::are_external_tools_available();
+
+        // If the default wordlist has already been downloaded, pre-select it.
+        let (default_wordlist, wordlist_status) = match default_wordlist_path() {
+            Some(p) if p.exists() => (
+                p.to_string_lossy().to_string(),
+                Some("Default wordlist ready (rockyou.txt)".to_string()),
+            ),
+            _ => (String::new(), None),
+        };
 
         Self {
             handshake_path: String::new(),
@@ -86,7 +116,7 @@ impl Default for CrackScreen {
             method: CrackMethod::Numeric,
             min_digits: "8".to_string(),
             max_digits: "8".to_string(),
-            wordlist_path: String::new(),
+            wordlist_path: default_wordlist,
             threads: num_cpus::get(),
             is_cracking: false,
             progress: 0.0,
@@ -100,6 +130,8 @@ impl Default for CrackScreen {
             log_messages: Vec::new(),
             hashcat_available: hashcat,
             hcxtools_available: hcxtools,
+            is_downloading_wordlist: false,
+            wordlist_status,
         }
     }
 }
@@ -163,6 +195,7 @@ impl CrackScreen {
             text("Cracking Engine").size(13).color(colors::TEXT),
             pick_list(engine_options, Some(self.engine), Message::EngineChanged,)
                 .padding(10)
+                .style(theme::pick_list_style)
                 .width(Length::Fill),
         ]
         .spacing(6);
@@ -215,6 +248,7 @@ impl CrackScreen {
                     .on_input(Message::HandshakePathChanged)
                     .padding(10)
                     .size(14)
+                    .style(theme::text_input_style)
                     .width(Length::Fill),
                 button(text("Browse").size(13))
                     .padding([10, 15])
@@ -234,6 +268,7 @@ impl CrackScreen {
                 Message::MethodChanged,
             )
             .padding(10)
+            .style(theme::pick_list_style)
             .width(Length::Fill),
         ]
         .spacing(6);
@@ -253,6 +288,7 @@ impl CrackScreen {
                                 .on_input(Message::MinDigitsChanged)
                                 .padding(10)
                                 .size(14)
+                                .style(theme::text_input_style)
                                 .width(Length::Fixed(100.0)),
                         ]
                         .spacing(4),
@@ -262,6 +298,7 @@ impl CrackScreen {
                                 .on_input(Message::MaxDigitsChanged)
                                 .padding(10)
                                 .size(14)
+                                .style(theme::text_input_style)
                                 .width(Length::Fixed(100.0)),
                         ]
                         .spacing(4),
@@ -275,8 +312,19 @@ impl CrackScreen {
             )
             .style(theme::card_style)
             .into(),
-            CrackMethod::Wordlist => container(
-                column![
+            CrackMethod::Wordlist => {
+                let download_btn = if self.is_downloading_wordlist {
+                    button(text("Downloading…").size(13))
+                        .padding([10, 15])
+                        .style(theme::secondary_button_style)
+                } else {
+                    button(text("Download default (rockyou)").size(13))
+                        .padding([10, 15])
+                        .style(theme::primary_button_style)
+                        .on_press(Message::DownloadDefaultWordlist)
+                };
+
+                let mut wl_col = column![
                     text("Wordlist Attack Options").size(14).color(colors::TEXT),
                     text("Tests passwords from a wordlist file (e.g., rockyou.txt)")
                         .size(12)
@@ -286,19 +334,33 @@ impl CrackScreen {
                             .on_input(Message::WordlistPathChanged)
                             .padding(10)
                             .size(14)
+                            .style(theme::text_input_style)
                             .width(Length::Fill),
                         button(text("Browse").size(13))
                             .padding([10, 15])
                             .style(theme::secondary_button_style)
                             .on_press(Message::BrowseWordlist),
+                        download_btn,
                     ]
                     .spacing(10),
                 ]
-                .spacing(10)
-                .padding(15),
-            )
-            .style(theme::card_style)
-            .into(),
+                .spacing(10);
+
+                if let Some(status) = &self.wordlist_status {
+                    let color = if status.contains("failed") || status.contains("Could not") {
+                        colors::DANGER
+                    } else if status.contains("Downloading") {
+                        colors::WARNING
+                    } else {
+                        colors::SUCCESS
+                    };
+                    wl_col = wl_col.push(text(status).size(11).color(color));
+                }
+
+                container(wl_col.padding(15))
+                    .style(theme::card_style)
+                    .into()
+            }
         };
 
         // Threads configuration (only show for native engine)
@@ -378,7 +440,7 @@ impl CrackScreen {
                         text("Password Found!").size(18).color(colors::SUCCESS),
                         container(
                             row![
-                                text(password).size(24).color(colors::TEXT),
+                                text(password).size(24).color(colors::ACCENT),
                                 horizontal_space(),
                                 button(text("Copy").size(13))
                                     .padding([8, 15])
@@ -388,17 +450,7 @@ impl CrackScreen {
                             .align_y(iced::Alignment::Center)
                             .padding(15)
                         )
-                        .style(|_| container::Style {
-                            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                                0.18, 0.80, 0.44, 0.2
-                            ))),
-                            border: iced::Border {
-                                color: colors::SUCCESS,
-                                width: 2.0,
-                                radius: 6.0.into(),
-                            },
-                            ..Default::default()
-                        }),
+                        .style(theme::callout_style(colors::SUCCESS)),
                     ]
                     .spacing(10)
                     .padding(15),
@@ -500,9 +552,14 @@ impl CrackScreen {
                     column![
                         text("Logs").size(13).color(colors::TEXT),
                         scrollable(
-                            container(text(self.log_messages.join("\n")).size(11))
-                                .padding(8)
-                                .width(Length::Fill)
+                            container(
+                                text(self.log_messages.join("\n"))
+                                    .size(11)
+                                    .color(colors::TEXT_DIM)
+                            )
+                            .padding(10)
+                            .width(Length::Fill)
+                            .style(theme::panel_style)
                         )
                         .height(Length::Fixed(150.0))
                     ]

@@ -129,6 +129,70 @@ impl BruteforceApp {
         Task::none()
     }
 
+    /// Download the default wordlist (rockyou.txt) and set it as the active one.
+    pub fn handle_download_default_wordlist(&mut self) -> Task<Message> {
+        use crate::screens::{default_wordlist_path, DEFAULT_WORDLIST_URL};
+
+        if self.crack_screen.is_downloading_wordlist {
+            return Task::none();
+        }
+
+        let dest = match default_wordlist_path() {
+            Some(p) => p,
+            None => {
+                self.crack_screen.wordlist_status =
+                    Some("Could not determine home directory for wordlist".to_string());
+                return Task::none();
+            }
+        };
+
+        // Already present? Just use it.
+        if dest.exists() {
+            let path_str = dest.to_string_lossy().to_string();
+            self.crack_screen.wordlist_path = path_str.clone();
+            self.crack_screen.wordlist_status =
+                Some("Default wordlist already downloaded".to_string());
+            self.add_crack_log(format!("📁 Using default wordlist: {}", path_str));
+            self.persist_state();
+            return Task::none();
+        }
+
+        self.crack_screen.is_downloading_wordlist = true;
+        self.crack_screen.wordlist_status = Some("Downloading rockyou.txt (~134 MB)…".to_string());
+        self.add_crack_log("⬇️  Downloading default wordlist (rockyou.txt)…".to_string());
+
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || download_wordlist(&dest, DEFAULT_WORDLIST_URL))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Download task failed: {}", e)))
+            },
+            Message::WordlistDownloadComplete,
+        )
+    }
+
+    /// Handle completion of the default wordlist download.
+    pub fn handle_wordlist_download_complete(
+        &mut self,
+        result: Result<String, String>,
+    ) -> Task<Message> {
+        self.crack_screen.is_downloading_wordlist = false;
+        match result {
+            Ok(path) => {
+                self.crack_screen.wordlist_path = path.clone();
+                self.crack_screen.wordlist_status =
+                    Some("Default wordlist ready (rockyou.txt)".to_string());
+                self.add_crack_log(format!("✅ Default wordlist ready: {}", path));
+                self.persist_state();
+            }
+            Err(err) => {
+                self.crack_screen.wordlist_status = Some(format!("Download failed: {}", err));
+                self.add_crack_log(format!("❌ Wordlist download failed: {}", err));
+            }
+        }
+        Task::none()
+    }
+
     /// Start cracking process
     pub fn handle_start_crack(&mut self) -> Task<Message> {
         // Validate handshake file exists
@@ -407,4 +471,48 @@ impl BruteforceApp {
             }
         }
     }
+}
+
+/// Download a wordlist from `url` to `dest` using the system `curl`.
+///
+/// Downloads to a temporary `.part` file first, then atomically renames it into
+/// place so a partial/interrupted download never looks like a valid wordlist.
+fn download_wordlist(dest: &std::path::Path, url: &str) -> Result<String, String> {
+    use std::process::Command;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create wordlist directory: {}", e))?;
+    }
+
+    let part = dest.with_extension("part");
+
+    let status = Command::new("curl")
+        .arg("-L") // follow redirects
+        .arg("-f") // fail on HTTP errors
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--max-time")
+        .arg("900")
+        .arg("-o")
+        .arg(&part)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("Failed to run curl: {}", e))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("curl exited with status {}", status));
+    }
+
+    // Sanity check: a real wordlist is far larger than a few KB.
+    let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    if size < 1024 {
+        let _ = std::fs::remove_file(&part);
+        return Err("downloaded file is too small — source may be unavailable".to_string());
+    }
+
+    std::fs::rename(&part, dest).map_err(|e| format!("Failed to finalize wordlist file: {}", e))?;
+
+    Ok(dest.to_string_lossy().to_string())
 }
