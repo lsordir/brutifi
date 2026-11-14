@@ -253,8 +253,12 @@ pub fn get_hashcat_version() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Detect available hashcat devices and return optimal device type
-/// Returns: 3 for CPU+GPU (best), 2 for GPU only, 1 for CPU only
+/// Detect available hashcat devices and return the optimal device type.
+///
+/// Returns 2 for GPU, 1 for CPU-only. NOTE: hashcat v8 removed the old
+/// `-D 3` (CPU+GPU) combination — `-D` now only accepts 1 (CPU) or 2 (GPU) —
+/// so we never return 3. A GPU is strongly preferred when present (and on
+/// Apple Silicon there is no CPU backend device at all).
 pub fn detect_optimal_device_type() -> u8 {
     let Some(bin) = find_hashcat_binary() else {
         return 2;
@@ -265,21 +269,18 @@ pub fn detect_optimal_device_type() -> u8 {
     if let Ok(output) = output {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Check if GPU is available (Metal or OpenCL)
+        // Prefer the GPU whenever one is available (Metal or OpenCL).
         if stdout.contains("Type...........: GPU") || stdout.contains("Metal Info:") {
-            // Try CPU+GPU first (level 3) for maximum performance
-            // If it doesn't work, the app will fallback automatically
-            // Note: On some macOS configs, only GPU-only (-D 2) works
-            return 3; // CPU+GPU for maximum performance
+            return 2; // GPU
         }
 
-        // Check if CPU is available
+        // Otherwise fall back to CPU if one is exposed.
         if stdout.contains("Type...........: CPU") {
             return 1; // CPU only
         }
     }
 
-    // Fallback to GPU only if detection unclear
+    // Default to GPU if detection is unclear.
     2
 }
 
@@ -366,7 +367,9 @@ pub struct HashcatParams {
     pub status: bool,
     /// Workload profile (1=Low, 2=Default, 3=High, 4=Nightmare)
     pub workload: u8,
-    /// Device types: 1=CPU, 2=GPU, 3=CPU+GPU
+    /// Device types (hashcat `-D`): 1=CPU, 2=GPU. Any other value means
+    /// "auto" (the `-D` flag is omitted so hashcat picks). hashcat v8 removed
+    /// the old 3=CPU+GPU combination.
     pub device_types: u8,
 }
 
@@ -494,8 +497,12 @@ pub fn run_hashcat(
 
     cmd.arg("-w").arg(params.workload.to_string());
 
-    // Device selection: CPU+GPU for maximum performance
-    cmd.arg("-D").arg(params.device_types.to_string());
+    // Device selection. hashcat v8 only accepts -D 1 (CPU) or -D 2 (GPU); the
+    // old -D 3 (CPU+GPU) was removed and makes hashcat abort. For any other
+    // value, omit -D entirely and let hashcat auto-select the best device(s).
+    if params.device_types == 1 || params.device_types == 2 {
+        cmd.arg("-D").arg(params.device_types.to_string());
+    }
 
     // Potfile path in /tmp to avoid conflicts
     // CRITICAL: Remove old potfile to avoid returning cached results
@@ -692,11 +699,17 @@ pub fn run_hashcat(
 
             stderr_output.push(trimmed.to_string());
 
-            if trimmed.contains("No devices found/left") {
-                if params.device_types == 3 {
+            // Device problems: the classic "No devices found/left", or hashcat
+            // v8's message when an invalid -D (e.g. the removed 3) is passed.
+            let device_problem = trimmed.contains("No devices found/left")
+                || trimmed.contains("no longer exists")
+                || trimmed.contains("assimilation bridge");
+            if device_problem {
+                if params.device_types != 2 {
+                    // Retry on the GPU, which is the reliable choice in v8.
                     retry_gpu_only = true;
                     progress_callback(HashcatProgress {
-                        status: "CPU+GPU mode failed, retrying with GPU-only...".to_string(),
+                        status: "Retrying with GPU (-D 2)...".to_string(),
                         progress_percent: 0.0,
                         speed: "Retrying...".to_string(),
                         rate_per_sec: 0.0,
@@ -709,7 +722,8 @@ pub fn run_hashcat(
                     let _ = child.kill();
                     let _ = child.wait();
                     return HashcatResult::Error(
-                        "No devices found/left. Hashcat could not access a usable GPU.".to_string(),
+                        "No usable GPU device. Hashcat could not access a GPU on this system."
+                            .to_string(),
                     );
                 }
             }
