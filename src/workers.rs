@@ -125,6 +125,7 @@ pub struct CaptureParams {
     pub interface: String,
     pub channel: Option<u32>,
     pub ssid: Option<String>,
+    pub bssid: Option<String>,
     pub output_file: String,
 }
 
@@ -145,6 +146,7 @@ pub async fn capture_async(
     let output_file = params.output_file.clone();
     let interface = params.interface.clone();
     let ssid = params.ssid.clone();
+    let bssid = params.bssid.clone();
 
     if std::path::Path::new(&output_file).exists() {
         if let Err(e) = std::fs::remove_file(&output_file) {
@@ -228,7 +230,7 @@ pub async fn capture_async(
             interface: &interface,
             channel: params.channel,
             ssid: ssid.as_deref(),
-            bssid: None,
+            bssid: bssid.as_deref(),
             output_file: &params.output_file,
             duration: None, // Run until stopped
             // Automatic deauth is ON: once the target AP is identified, the engine

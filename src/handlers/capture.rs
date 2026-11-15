@@ -213,10 +213,20 @@ impl BruteforceApp {
             return Task::none();
         }
 
+        // Extract primary BSSID (strip " (+N more)" suffix from compacted
+        // multi-AP entries so we always pass a clean MAC address).
+        let primary_bssid = network
+            .bssid
+            .split(" (+")
+            .next()
+            .unwrap_or(&network.bssid)
+            .to_string();
+
         let params = CaptureParams {
             interface: self.scan_capture_screen.selected_interface.clone(),
             channel,
             ssid: Some(network.ssid.clone()),
+            bssid: Some(primary_bssid),
             output_file: self.scan_capture_screen.output_file.clone(),
         };
 

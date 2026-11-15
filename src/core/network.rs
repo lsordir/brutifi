@@ -412,12 +412,14 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
         None
     };
 
-    // macOS packet injection warning
+    // macOS packet injection warning (only on macOS)
     if !no_deauth {
-        println!();
-        log("⚠️ macOS LIMITATION: Apple Silicon Macs do not support raw packet injection.");
-        log("💡 If the deauth sender reports TX errors, force the handshake manually: turn the target device's WiFi OFF then ON.");
-        println!();
+        if cfg!(target_os = "macos") {
+            println!();
+            log("⚠️ macOS LIMITATION: Apple Silicon Macs do not support raw packet injection.");
+            log("💡 If the deauth sender reports TX errors, force the handshake manually: turn the target device's WiFi OFF then ON.");
+            println!();
+        }
     } else {
         log("ℹ️ Passive capture mode (deauth disabled)");
     }
@@ -623,6 +625,14 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
 
     // State for deauth attack
     let mut target_bssid: Option<[u8; 6]> = parsed_bssid;
+    if let Some(b) = parsed_bssid {
+        log(&format!(
+            "🎯 Target BSSID: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} — deauth will start immediately",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        ));
+    } else {
+        log("ℹ️ No BSSID provided — will discover from beacon frames (deauth delayed until found)");
+    }
     let mut last_deauth = std::time::Instant::now();
     let mut deauth_tx_dead = false; // Fallback path: stop once TX is known-bad
                                     // Helper to find BSSID from SSID if needed
