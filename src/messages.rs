@@ -70,5 +70,6 @@ pub enum Message {
     CopyPassword,
 
     // General
+    StopAll,
     Tick,
 }

@@ -213,6 +213,7 @@ impl BruteforceApp {
             Message::CopyPassword => self.handle_copy_password(),
 
             // General
+            Message::StopAll => self.handle_stop_all(),
             Message::Tick => self.handle_tick(),
         }
     }
@@ -251,6 +252,25 @@ impl BruteforceApp {
             .padding([5, 12])
             .style(crate::theme::badge_style(chip_color));
 
+        // --- Global "Stop All" kill switch (only while something is running) ---
+        let anything_running = self.scan_capture_screen.is_capturing
+            || self.crack_screen.is_cracking
+            || self.scan_capture_screen.fake_ap_running
+            || self.scan_capture_screen.portal_running
+            || self.capture_state.is_some()
+            || self.crack_state.is_some();
+        let stop_all_btn: Option<Element<'_, Message>> = if anything_running {
+            Some(
+                button(text("■ Stop All").size(12))
+                    .padding([6, 14])
+                    .style(crate::theme::danger_button_style)
+                    .on_press(Message::StopAll)
+                    .into(),
+            )
+        } else {
+            None
+        };
+
         // --- Segmented navigation ---
         let nav = row![
             nav_button("Scan & Capture", "1", Screen::ScanCapture, self.screen),
@@ -271,19 +291,22 @@ impl BruteforceApp {
             });
 
         // --- Header bar ---
-        let header = container(
-            row![
-                brand,
-                iced::widget::horizontal_space(),
-                nav_segment,
-                iced::widget::horizontal_space().width(16),
-                status_chip,
-            ]
-            .align_y(iced::Alignment::Center)
-            .padding([12, 20]),
-        )
-        .width(Length::Fill)
-        .style(crate::theme::header_style);
+        let mut header_row = row![
+            brand,
+            iced::widget::horizontal_space(),
+            nav_segment,
+            iced::widget::horizontal_space().width(16),
+        ]
+        .align_y(iced::Alignment::Center);
+        if let Some(stop) = stop_all_btn {
+            header_row = header_row.push(stop);
+            header_row = header_row.push(iced::widget::horizontal_space().width(10));
+        }
+        header_row = header_row.push(status_chip);
+
+        let header = container(header_row.padding([12, 20]))
+            .width(Length::Fill)
+            .style(crate::theme::header_style);
 
         // Current screen content
         let content = match self.screen {

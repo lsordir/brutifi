@@ -987,6 +987,16 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
             last_channel_switch = std::time::Instant::now();
         }
 
+        // 2b. Linux: when locked to a single channel, periodically re-assert it.
+        // NetworkManager/regulatory changes can silently move the card off the
+        // target channel, which is why a reconnecting client's handshake is
+        // sometimes never captured.
+        #[cfg(target_os = "linux")]
+        if channels_to_scan.len() == 1 && last_channel_switch.elapsed() >= Duration::from_secs(3) {
+            set_channel_for_os(interface, channels_to_scan[0]);
+            last_channel_switch = std::time::Instant::now();
+        }
+
         // 3. Deauth logic.
         if !no_deauth {
             if parallel_deauth_active {
@@ -1272,32 +1282,53 @@ fn prepend_radiotap(frame: &[u8]) -> Vec<u8> {
 /// radiotap header instead. The working format is probed once and memoized.
 fn send_deauth(cap: &mut Capture<pcap::Active>, bssid: &[u8; 6], target: &[u8; 6]) -> Result<()> {
     let frame = build_deauth_frame(bssid, target);
-    let format = TX_FRAME_FORMAT.load(Ordering::Relaxed);
 
-    if format == 1 {
-        cap.sendpacket(frame)
-            .map_err(|e| anyhow!("send error (raw 802.11): {}", e))
-    } else if format == 2 {
-        cap.sendpacket(prepend_radiotap(&frame))
-            .map_err(|e| anyhow!("send error (radiotap): {}", e))
-    } else {
-        // Probe: raw first (macOS), then radiotap (Linux convention).
-        match cap.sendpacket(frame.clone()) {
-            Ok(()) => {
-                TX_FRAME_FORMAT.store(1, Ordering::Relaxed);
-                Ok(())
+    // Pick the encapsulation by OS, NOT by "did sendpacket return Ok". On Linux
+    // monitor interfaces, writing a bare 802.11 frame succeeds at the syscall
+    // level but the driver parses the leading bytes as a radiotap header, so the
+    // frame never goes out — which made deauth silently do nothing. mac80211
+    // expects radiotap + 802.11; macOS BPF expects the raw 802.11 frame.
+    let preferred = match TX_FRAME_FORMAT.load(Ordering::Relaxed) {
+        0 => {
+            if cfg!(target_os = "linux") {
+                2
+            } else {
+                1
             }
-            Err(raw_err) => match cap.sendpacket(prepend_radiotap(&frame)) {
+        }
+        f => f,
+    };
+
+    let build = |fmt: u8| -> Vec<u8> {
+        if fmt == 2 {
+            prepend_radiotap(&frame)
+        } else {
+            frame.clone()
+        }
+    };
+
+    match cap.sendpacket(build(preferred)) {
+        Ok(()) => {
+            TX_FRAME_FORMAT.store(preferred, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(primary_err) => {
+            // Fall back to the other encapsulation once, in case the preferred
+            // one is rejected by this particular driver.
+            let alt = if preferred == 2 { 1 } else { 2 };
+            match cap.sendpacket(build(alt)) {
                 Ok(()) => {
-                    TX_FRAME_FORMAT.store(2, Ordering::Relaxed);
+                    TX_FRAME_FORMAT.store(alt, Ordering::Relaxed);
                     Ok(())
                 }
-                Err(radiotap_err) => Err(anyhow!(
-                    "send error (raw: {}; radiotap: {})",
-                    raw_err,
-                    radiotap_err
+                Err(alt_err) => Err(anyhow!(
+                    "send error (fmt {}: {}; fmt {}: {})",
+                    preferred,
+                    primary_err,
+                    alt,
+                    alt_err
                 )),
-            },
+            }
         }
     }
 }
@@ -2086,31 +2117,66 @@ fn set_channel_for_os(interface: &str, channel: u32) -> bool {
 /// RAII guard that switches the interface to monitor mode on Linux via
 /// ip/iw (libpcap's rfmon is unreliable on mac80211) and restores managed
 /// mode when dropped.
+///
+/// Crucially, it first tells NetworkManager to stop managing the interface.
+/// This is the #1 reason capture "silently" fails on Linux: NetworkManager /
+/// wpa_supplicant keep the card in managed mode and change its channel, so the
+/// 4-way handshake is never seen even while a client reconnects.
 #[cfg(target_os = "linux")]
 struct LinuxMonitorGuard {
     interface: String,
+    nm_released: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxMonitorGuard {
     fn enter(interface: &str, log: &Arc<dyn Fn(&str) + Send + Sync>) -> Self {
-        let run = |args: &[&str]| -> bool {
-            Command::new(args[0])
-                .args(&args[1..])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+        // Returns (success, stderr) so failures can be reported.
+        let run = |args: &[&str]| -> (bool, String) {
+            match Command::new(args[0]).args(&args[1..]).output() {
+                Ok(o) => (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                ),
+                Err(e) => (false, e.to_string()),
+            }
         };
-        let ok = run(&["ip", "link", "set", "dev", interface, "down"])
-            && run(&["iw", "dev", interface, "set", "type", "monitor"])
-            && run(&["ip", "link", "set", "dev", interface, "up"]);
-        if ok {
+
+        // 0. Make sure the radio isn't soft-blocked.
+        let _ = run(&["rfkill", "unblock", "wifi"]);
+
+        // 1. Ask NetworkManager to release this interface (best-effort). This
+        //    stops it from yanking the card back to managed mode / hopping it.
+        let (nm_released, _) = run(&["nmcli", "device", "set", interface, "managed", "no"]);
+        if nm_released {
+            log("✓ NetworkManager released the interface");
+        } else {
+            log("ℹ️ NetworkManager not managing this interface (or nmcli absent) — continuing");
+        }
+
+        // 2. Enter monitor mode: down → set type monitor → up.
+        let (down_ok, down_err) = run(&["ip", "link", "set", "dev", interface, "down"]);
+        let (mon_ok, mon_err) = run(&["iw", "dev", interface, "set", "type", "monitor"]);
+        let (up_ok, up_err) = run(&["ip", "link", "set", "dev", interface, "up"]);
+
+        if down_ok && mon_ok && up_ok {
             log("✓ Monitor mode enabled (ip/iw)");
         } else {
-            log("⚠️ Could not set monitor mode via ip/iw — capture may fail");
+            let detail = [down_err, mon_err, up_err]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            log(&format!(
+                "⚠️ Monitor mode setup failed (down:{down_ok} monitor:{mon_ok} up:{up_ok}). \
+                 Run with sudo, make sure the adapter supports monitor mode (`iw list` → \
+                 'Supported interface modes: monitor'), and that `ip`/`iw` are installed. {detail}"
+            ));
         }
+
         Self {
             interface: interface.to_string(),
+            nm_released,
         }
     }
 }
@@ -2124,5 +2190,9 @@ impl Drop for LinuxMonitorGuard {
         run(&["ip", "link", "set", "dev", &self.interface, "down"]);
         run(&["iw", "dev", &self.interface, "set", "type", "managed"]);
         run(&["ip", "link", "set", "dev", &self.interface, "up"]);
+        // Hand the interface back to NetworkManager if we took it away.
+        if self.nm_released {
+            run(&["nmcli", "device", "set", &self.interface, "managed", "yes"]);
+        }
     }
 }
