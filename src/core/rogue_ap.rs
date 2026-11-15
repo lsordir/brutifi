@@ -59,10 +59,22 @@ impl FakeApStatus {
 }
 
 /// Snapshot of everything `start_fake_ap` changes, restored by `stop_fake_ap`.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// The Linux fields are only set by the hostapd backend.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct SavedConfig {
+    #[serde(default)]
     computer_name: String,
+    #[serde(default)]
     had_nat_plist: bool,
+    /// Linux: PID of the spawned hostapd process.
+    #[serde(default)]
+    hostapd_pid: Option<u32>,
+    /// Linux: PID of the spawned dnsmasq process.
+    #[serde(default)]
+    dnsmasq_pid: Option<u32>,
+    /// Linux: wireless interface hosting the AP.
+    #[serde(default)]
+    iface: Option<String>,
 }
 
 /// Start broadcasting an open (no password) fake access point.
@@ -94,6 +106,11 @@ pub fn start_fake_ap(ssid: &str) -> Result<()> {
         ));
     }
 
+    // Linux backend: real AP via hostapd + dnsmasq (no Internet Sharing).
+    if cfg!(target_os = "linux") {
+        return start_fake_ap_linux(ssid);
+    }
+
     // 1. Snapshot everything we are about to change.
     let saved = snapshot_config()?;
 
@@ -116,6 +133,10 @@ pub fn stop_fake_ap() -> Result<()> {
     ensure_root()?;
     log_step("stop_fake_ap()");
 
+    if cfg!(target_os = "linux") {
+        return stop_fake_ap_linux();
+    }
+
     let disable_result = disable_internet_sharing();
     log_step(&format!("disable daemon: {:?}", disable_result));
 
@@ -132,6 +153,9 @@ pub fn stop_fake_ap() -> Result<()> {
 
 /// Whether a hosted (AP mode) network is currently broadcasting.
 pub fn fake_ap_status() -> FakeApStatus {
+    if cfg!(target_os = "linux") {
+        return fake_ap_status_linux();
+    }
     match run_swift(STATUS_SCRIPT, STATUS_SCRIPT_SOURCE, &[]) {
         Ok(out) if out.starts_with("up:") => {
             let ssid = out[3..].trim();
@@ -172,6 +196,7 @@ fn snapshot_config() -> Result<SavedConfig> {
     let saved = SavedConfig {
         computer_name,
         had_nat_plist,
+        ..SavedConfig::default()
     };
 
     if let Ok(json) = serde_json::to_string(&saved) {
@@ -503,3 +528,166 @@ guard let iface = CWWiFiClient.shared().interface(), iface.interfaceMode() == .h
 }
 print("up:\(iface.ssid() ?? "")")
 "#;
+
+// ============================================================================
+// Linux backend: real open AP via hostapd + dnsmasq
+//
+// Unlike macOS (Internet Sharing), Linux hosts a proper AP directly on the
+// Wi-Fi adapter. hostapd broadcasts the open network, dnsmasq serves DHCP
+// and answers every DNS query with this host, and the portal's iptables
+// rule captures port 80 — so captive-portal detection pops the login page
+// without needing any internet uplink.
+// ============================================================================
+
+const HOSTAPD_CONF: &str = "/tmp/brutifi_hostapd.conf";
+const DNSMASQ_CONF: &str = "/tmp/brutifi_dnsmasq.conf";
+/// Gateway/host address of the AP subnet on Linux (portal.rs looks for it).
+pub(crate) const AP_GATEWAY: &str = "192.168.87.1";
+
+fn start_fake_ap_linux(ssid: &str) -> Result<()> {
+    let iface = crate::core::network::first_wireless_interface_linux()
+        .ok_or_else(|| anyhow!("no wireless interface found (checked 'iw dev')"))?;
+    log_step(&format!("linux fake ap: iface={iface} ssid='{ssid}'"));
+
+    for tool in ["hostapd", "dnsmasq"] {
+        if !tool_available(tool) {
+            return Err(anyhow!(
+                "'{tool}' is not installed — on Kali/Debian: sudo apt install {tool}"
+            ));
+        }
+    }
+
+    // Stop NetworkManager from fighting us for the interface, and make sure
+    // it is in managed mode (a leftover monitor capture would break hostapd).
+    let _ = run_command("nmcli", &["device", "set", &iface, "managed", "no"]);
+    let _ = run_command("ip", &["link", "set", "dev", &iface, "down"]);
+    let _ = run_command("iw", &["dev", &iface, "set", "type", "managed"]);
+
+    // 1. Static host address on the AP interface.
+    run_command("ip", &["addr", "flush", "dev", &iface])
+        .context("failed to flush interface addresses")?;
+    run_command("ip", &["link", "set", "dev", &iface, "up"])
+        .context("failed to bring the interface up")?;
+    run_command(
+        "ip",
+        &["addr", "add", &format!("{AP_GATEWAY}/24"), "dev", &iface],
+    )
+    .context("failed to set the AP address")?;
+
+    // 2. hostapd config: open network (no wpa_* keys => no password).
+    let hostapd_conf = format!(
+        "interface={iface}\ndriver=nl80211\nssid={ssid}\nchannel=6\nhw_mode=g\nauth_algs=1\nmacaddr_acl=0\nignore_broadcast_ssid=0\n"
+    );
+    fs::write(HOSTAPD_CONF, hostapd_conf).context("failed to write the hostapd config")?;
+
+    // 3. dnsmasq: DHCP + DNS — every query resolves to this host so
+    //    captive-portal probes reach the portal (iptables redirects :80).
+    let dnsmasq_conf = format!(
+        "interface={iface}\nbind-interfaces\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\n"
+    );
+    fs::write(DNSMASQ_CONF, dnsmasq_conf).context("failed to write the dnsmasq config")?;
+
+    // 4. Launch dnsmasq (keep in foreground so the PID is ours) + hostapd.
+    let dnsmasq = Command::new("dnsmasq")
+        .args(["--keep-in-foreground", "--conf-file", DNSMASQ_CONF])
+        .spawn()
+        .context("failed to start dnsmasq (is port 53 already in use?)")?;
+    let dnsmasq_pid = dnsmasq.id();
+
+    let hostapd = Command::new("hostapd")
+        .arg(HOSTAPD_CONF)
+        .spawn()
+        .context("failed to start hostapd")?;
+    let hostapd_pid = hostapd.id();
+
+    // A bad driver/channel makes hostapd exit almost immediately.
+    std::thread::sleep(Duration::from_millis(1800));
+    if !pid_alive(hostapd_pid) {
+        log_step("hostapd exited immediately — rolling back");
+        let _ = stop_fake_ap_linux();
+        return Err(anyhow!(
+            "hostapd exited immediately — run 'hostapd {HOSTAPD_CONF}' manually to see why (the driver may not support AP mode)"
+        ));
+    }
+
+    let saved = SavedConfig {
+        hostapd_pid: Some(hostapd_pid),
+        dnsmasq_pid: Some(dnsmasq_pid),
+        iface: Some(iface),
+        ..SavedConfig::default()
+    };
+    if let Ok(json) = serde_json::to_string(&saved) {
+        let _ = fs::write(STATE_FILE, json);
+    }
+
+    log_step("linux fake AP is up (hostapd + dnsmasq)");
+    Ok(())
+}
+
+fn stop_fake_ap_linux() -> Result<()> {
+    let saved: SavedConfig = fs::read_to_string(STATE_FILE)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+
+    if let Some(pid) = saved.hostapd_pid {
+        signal_term(pid);
+    }
+    if let Some(pid) = saved.dnsmasq_pid {
+        signal_term(pid);
+    }
+    // Orphans from a crashed session (best effort).
+    let _ = run_command("pkill", &["-f", DNSMASQ_CONF]);
+    let _ = run_command("pkill", &["-f", HOSTAPD_CONF]);
+
+    if let Some(iface) = &saved.iface {
+        let _ = run_command("ip", &["addr", "flush", "dev", iface]);
+        let _ = run_command("ip", &["link", "set", "dev", iface, "down"]);
+        // Hand the interface back to NetworkManager.
+        let _ = run_command("nmcli", &["device", "set", iface, "managed", "yes"]);
+    }
+
+    let _ = fs::remove_file(HOSTAPD_CONF);
+    let _ = fs::remove_file(DNSMASQ_CONF);
+    let _ = fs::remove_file(STATE_FILE);
+    log_step("linux fake AP stopped, interface restored");
+    Ok(())
+}
+
+fn fake_ap_status_linux() -> FakeApStatus {
+    let saved: SavedConfig = fs::read_to_string(STATE_FILE)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default();
+
+    match saved.hostapd_pid {
+        Some(pid) if pid_alive(pid) => {
+            let ssid = fs::read_to_string(HOSTAPD_CONF).ok().and_then(|conf| {
+                conf.lines()
+                    .find_map(|line| line.strip_prefix("ssid="))
+                    .map(str::to_string)
+            });
+            FakeApStatus::Up(ssid)
+        }
+        _ => FakeApStatus::Down,
+    }
+}
+
+fn tool_available(name: &str) -> bool {
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Signal-0 existence check for a PID.
+fn pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn signal_term(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}

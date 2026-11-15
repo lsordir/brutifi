@@ -167,6 +167,7 @@ impl BruteforceApp {
             Message::SelectNetwork(idx) => self.handle_select_network(idx),
             Message::SelectChannel(channel) => self.handle_select_channel(channel),
             Message::InterfaceSelected(interface) => self.handle_interface_selected(interface),
+            Message::RefreshInterfaces => self.handle_refresh_interfaces(),
 
             // Capture
             Message::BrowseCaptureFile => self.handle_browse_capture_file(),
@@ -407,7 +408,7 @@ impl BruteforceApp {
     }
 }
 
-fn list_interfaces() -> Vec<String> {
+pub(crate) fn list_interfaces() -> Vec<String> {
     let mut interfaces: Vec<String> = Device::list()
         .unwrap_or_default()
         .into_iter()
@@ -421,7 +422,7 @@ fn list_interfaces() -> Vec<String> {
     interfaces
 }
 
-fn choose_default_interface(interfaces: &[String]) -> String {
+pub(crate) fn choose_default_interface(interfaces: &[String]) -> String {
     if interfaces.iter().any(|name| name.as_str() == "en0") {
         return "en0".to_string();
     }

@@ -37,6 +37,13 @@ impl BruteforceApp {
 
     /// Start broadcasting the open fake AP
     pub fn handle_start_fake_ap(&mut self) -> Task<Message> {
+        // macOS drives Internet Sharing; Linux drives hostapd + dnsmasq.
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            self.scan_capture_screen.error_message =
+                Some("Fake AP is supported on macOS and Linux only.".to_string());
+            return Task::none();
+        }
+
         if self.scan_capture_screen.fake_ap_busy {
             return Task::none();
         }

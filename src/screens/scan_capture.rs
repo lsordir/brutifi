@@ -181,9 +181,15 @@ impl ScanCaptureScreen {
             .into()
         };
 
+        let refresh_btn = button(text("⟳").size(13))
+            .padding([6, 10])
+            .style(theme::secondary_button_style)
+            .on_press(Message::RefreshInterfaces);
+
         let interface_row = row![
             text("Interface").size(11).color(colors::TEXT_DIM),
             interface_picker,
+            refresh_btn,
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -651,6 +657,20 @@ impl ScanCaptureScreen {
 
     /// Fake AP card: broadcast an open (no password) network clients can join.
     fn view_fake_ap_block(&self) -> Element<'_, Message> {
+        // macOS uses Internet Sharing + pf; Linux uses hostapd + dnsmasq +
+        // iptables. Other platforms are not supported yet.
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return components::card(
+                column![
+                    components::section_title("Fake Access Point"),
+                    text("The fake AP and captive portal run on macOS and Linux.")
+                        .size(11)
+                        .color(colors::TEXT_DIM),
+                ]
+                .spacing(8),
+            );
+        }
+
         let running = self.fake_ap_running;
         let busy = self.fake_ap_busy;
 
@@ -748,14 +768,23 @@ impl ScanCaptureScreen {
                 ],
             )
         } else {
-            components::callout(
-                colors::SECONDARY,
-                "Open, password-less test network",
-                &[
+            let lines: Vec<&str> = if cfg!(target_os = "linux") {
+                vec![
+                    "Hosts a real open network via hostapd — clients connect without a password.",
+                    "dnsmasq answers every DNS query with this host, so the captive portal auto-opens.",
+                    "Stop kills hostapd/dnsmasq and hands the interface back to NetworkManager.",
+                ]
+            } else {
+                vec![
                     "Broadcasts through macOS Internet Sharing — clients connect without a password.",
                     "Needs an uplink other than Wi-Fi (Ethernet or USB adapter); Wi-Fi hosts the network.",
                     "The Mac's computer name is used as the network name and restored on stop.",
-                ],
+                ]
+            };
+            components::callout(
+                colors::SECONDARY,
+                "Open, password-less test network",
+                &lines,
             )
         };
 

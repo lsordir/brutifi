@@ -236,7 +236,7 @@ impl BruteforceApp {
                         .to_string(),
                 );
                 self.add_capture_log(
-                    "ℹ️  On Apple Silicon Macs, injection often fails; if nothing reconnects, toggle the device's WiFi off/on manually.".to_string(),
+                    "ℹ️ The activity log shows whether deauth TX actually works — on Apple Silicon it is usually blocked, then toggle the target device's WiFi off/on manually.".to_string(),
                 );
             } else {
                 self.add_capture_log("⚠️ Start a capture first, then send a deauth.".to_string());

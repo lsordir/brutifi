@@ -27,6 +27,7 @@ pub enum Message {
     SelectNetwork(usize),
     SelectChannel(String),
     InterfaceSelected(String),
+    RefreshInterfaces,
     BrowseCaptureFile,
     CaptureFileSelected(Option<PathBuf>),
     DownloadCapturedPcap,

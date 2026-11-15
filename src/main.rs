@@ -48,6 +48,11 @@ pub(crate) fn relaunch_as_root_with_env(envs: &[(&'static str, String)]) -> bool
         Err(_) => return false,
     };
 
+    // Linux: pkexec (polkit) when available, sudo as fallback.
+    if cfg!(target_os = "linux") {
+        return relaunch_as_root_linux(&exe, envs);
+    }
+
     let user = env::var("USER").unwrap_or_else(|_| "".to_string());
     let home = env::var("HOME").unwrap_or_else(|_| "".to_string());
     let logname = env::var("LOGNAME").unwrap_or_else(|_| user.clone());
@@ -94,6 +99,41 @@ pub(crate) fn relaunch_as_root_with_env(envs: &[(&'static str, String)]) -> bool
 
 pub(crate) fn relaunch_as_root() -> bool {
     relaunch_as_root_with_env(&[])
+}
+
+/// Linux root relaunch: pkexec first (graphical polkit prompt), then sudo.
+fn relaunch_as_root_linux(exe: &std::path::Path, envs: &[(&'static str, String)]) -> bool {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // Preserve the user session context for file dialogs and tool lookup.
+    let mut env_pairs: Vec<String> = Vec::new();
+    for var in ["HOME", "USER", "LOGNAME", "PATH", "XDG_RUNTIME_DIR"] {
+        if let Ok(value) = env::var(var) {
+            if !value.is_empty() {
+                env_pairs.push(format!("{var}={value}"));
+            }
+        }
+    }
+    for (key, value) in envs {
+        env_pairs.push(format!("{key}={value}"));
+    }
+
+    let spawn_root = |program: &str, prefix: &[&str]| -> bool {
+        Command::new(program)
+            .args(prefix)
+            .arg("env")
+            .args(&env_pairs)
+            .arg(exe)
+            .args(&args)
+            .spawn()
+            .map(|_| true)
+            .unwrap_or(false)
+    };
+
+    if spawn_root("pkexec", &[]) {
+        return true;
+    }
+    spawn_root("sudo", &["-E"])
 }
 
 /// Setup panic handler to show errors instead of silent exit

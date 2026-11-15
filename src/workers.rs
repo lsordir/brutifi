@@ -216,6 +216,12 @@ pub async fn capture_async(
     // Run capture in blocking thread
     let running_clone = state.running.clone();
     let deauth_clone = state.deauth_requested.clone();
+    // Forward engine diagnostics (deauth TX health, channel switching, …)
+    // into the GUI activity log.
+    let log_tx = progress_tx.clone();
+    let log_cb = std::sync::Arc::new(move |msg: &str| {
+        let _ = log_tx.send(CaptureProgress::Log(msg.to_string()));
+    }) as std::sync::Arc<dyn Fn(&str) + Send + Sync>;
     let result = tokio::task::spawn_blocking(move || {
         // Build capture options inside the blocking thread
         let options = CaptureOptions {
@@ -233,6 +239,7 @@ pub async fn capture_async(
             no_deauth: false,
             running: Some(running_clone), // Pass the state for stopping
             deauth_requested: Some(deauth_clone), // User-triggered deauth bursts
+            log: Some(log_cb),
         };
 
         // Try to capture, with better error messages

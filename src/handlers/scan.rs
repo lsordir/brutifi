@@ -34,6 +34,24 @@ impl BruteforceApp {
         Task::none()
     }
 
+    /// Re-detect network interfaces (picks up adapters plugged in after launch)
+    pub fn handle_refresh_interfaces(&mut self) -> Task<Message> {
+        let interface_list = crate::app::list_interfaces();
+        let previous = self.scan_capture_screen.selected_interface.clone();
+        let selected_interface = if interface_list.iter().any(|name| name == &previous) {
+            previous
+        } else {
+            crate::app::choose_default_interface(&interface_list)
+        };
+        let count = interface_list.len();
+
+        self.scan_capture_screen.interface_list = interface_list;
+        self.scan_capture_screen.selected_interface = selected_interface;
+        self.add_capture_log(format!("🔄 Interfaces refreshed — {count} detected"));
+        self.persist_state();
+        Task::none()
+    }
+
     /// Handle scan completion
     pub fn handle_scan_complete(&mut self, result: ScanResult) -> Task<Message> {
         self.scan_capture_screen.is_scanning = false;

