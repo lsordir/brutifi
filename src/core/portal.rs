@@ -850,11 +850,10 @@ fn unlock_internet_linux() -> Result<()> {
         .args(["-f", super::rogue_ap::DNSMASQ_CONF])
         .output();
     Command::new("dnsmasq")
-        .args([
-            "--keep-in-foreground",
-            "--conf-file",
-            super::rogue_ap::DNSMASQ_CONF,
-        ])
+        // `--conf-file=<path>` equals form only — the separated form is
+        // rejected as "junk found in command line".
+        .arg("--keep-in-foreground")
+        .arg(format!("--conf-file={}", super::rogue_ap::DNSMASQ_CONF))
         .spawn()
         .context("failed to restart dnsmasq as a plain resolver")?;
 

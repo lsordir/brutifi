@@ -595,7 +595,13 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
     let dnsmasq_err = fs::File::create("/tmp/brutifi_dnsmasq.err")
         .context("failed to create the dnsmasq error log")?;
     let dnsmasq = Command::new("dnsmasq")
-        .args(["--keep-in-foreground", "--conf-file", DNSMASQ_CONF])
+        // NOTE: dnsmasq only accepts the `--conf-file=<path>` form — the
+        // separated form makes the bare path "junk" and it exits instantly
+        // ("junk found in command line").
+        .args([
+            "--keep-in-foreground",
+            &format!("--conf-file={DNSMASQ_CONF}"),
+        ])
         .stderr(dnsmasq_err)
         .spawn()
         .context("failed to start dnsmasq (is port 53 already in use?)")?;
