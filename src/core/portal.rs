@@ -542,19 +542,20 @@ fn find_sharing_gateway() -> Option<(String, String)> {
     let output = Command::new("ifconfig").arg("-a").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
 
-    let mut current_bridge: Option<String> = None;
+    // Internet Sharing always hosts clients on its own subnet with the Mac
+    // as 192.168.2.1 (bridge100 or the Wi-Fi interface, depending on the
+    // macOS version). Match THAT interface — a Thunderbolt bridge (bridge0)
+    // is the *uplink* side, where client traffic never arrives.
+    let mut current: Option<String> = None;
     for line in text.lines() {
         if !line.starts_with(char::is_whitespace) {
             // New interface block header, e.g. "bridge100: flags=..."
-            current_bridge = line
-                .split(':')
-                .next()
-                .filter(|name| name.starts_with("bridge"))
-                .map(str::to_string);
-        } else if let (Some(name), true) = (&current_bridge, line.trim().starts_with("inet ")) {
-            let ip = line.split_whitespace().nth(1)?;
-            if !ip.starts_with("127.") {
-                return Some((name.clone(), ip.to_string()));
+            current = line.split(':').next().map(str::to_string);
+        } else if let (Some(name), true) = (&current, line.trim().starts_with("inet ")) {
+            if let Some(ip) = line.split_whitespace().nth(1) {
+                if ip == "192.168.2.1" {
+                    return Some((name.clone(), ip.to_string()));
+                }
             }
         }
     }
