@@ -127,9 +127,12 @@ where
         }
     }
 
-    let listener = match TcpListener::bind(("0.0.0.0", config.port)) {
-        Ok(listener) => listener,
-        Err(e) => {
+    // Bind with a short retry — right after an AP restart the previous
+    // portal instance may still be releasing the port.
+    let listener = match bind_with_retry(config.port, 5) {
+        Some(listener) => listener,
+        None => {
+            let e = std::io::Error::last_os_error();
             let _ = drop_redirect(&redirect_slot);
             return Err(anyhow!(
                 "failed to bind port {} ({}). Is another portal instance running?",
@@ -191,6 +194,20 @@ fn drop_redirect(redirect_slot: &Arc<Mutex<Option<Result<Redirect, anyhow::Error
         Some(Ok(redirect)) => disable_redirect(&redirect).is_ok(),
         _ => false,
     }
+}
+
+/// Bind the portal listener, retrying briefly (an AP restart races the
+/// previous portal instance releasing the port).
+fn bind_with_retry(port: u16, tries: u32) -> Option<TcpListener> {
+    for attempt in 0..tries {
+        if let Ok(listener) = TcpListener::bind(("0.0.0.0", port)) {
+            return Some(listener);
+        }
+        if attempt + 1 < tries {
+            std::thread::sleep(Duration::from_millis(600));
+        }
+    }
+    None
 }
 
 // --- Connection handling ----------------------------------------------------

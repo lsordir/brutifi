@@ -557,9 +557,18 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
         }
     }
 
+    // Make every start idempotent: kill daemons left over from a previous
+    // (or crashed) run — they keep ports 53/67 busy and the second AP start
+    // then dies on bind.
+    let _ = run_command("pkill", &["-f", HOSTAPD_CONF]);
+    let _ = run_command("pkill", &["-f", DNSMASQ_CONF]);
+    std::thread::sleep(Duration::from_millis(300));
+
     // Stop NetworkManager from fighting us for the interface, and make sure
     // it is in managed mode (a leftover monitor capture would break hostapd).
     let _ = run_command("nmcli", &["device", "set", &iface, "managed", "no"]);
+    // Drop any connection NM currently holds on the interface.
+    let _ = run_command("nmcli", &["device", "disconnect", &iface]);
     let _ = run_command("ip", &["link", "set", "dev", &iface, "down"]);
     let _ = run_command("iw", &["dev", &iface, "set", "type", "managed"]);
 
@@ -656,10 +665,10 @@ fn stop_fake_ap_linux() -> Result<()> {
         .unwrap_or_default();
 
     if let Some(pid) = saved.hostapd_pid {
-        signal_term(pid);
+        terminate_daemon(pid);
     }
     if let Some(pid) = saved.dnsmasq_pid {
-        signal_term(pid);
+        terminate_daemon(pid);
     }
     // Orphans from a crashed session (best effort).
     let _ = run_command("pkill", &["-f", DNSMASQ_CONF]);
@@ -677,6 +686,36 @@ fn stop_fake_ap_linux() -> Result<()> {
     let _ = fs::remove_file(STATE_FILE);
     log_step("linux fake AP stopped, interface restored");
     Ok(())
+}
+
+/// Terminate a daemon cleanly and make sure it is REALLY gone, so the next
+/// AP start can bind ports 53/67 again: SIGTERM, then wait (reaping our
+/// child via waitpid, which also clears the zombie), then SIGKILL.
+fn terminate_daemon(pid: u32) {
+    let raw_pid = pid as libc::pid_t;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+
+    loop {
+        let reaped = unsafe { libc::waitpid(raw_pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if reaped == raw_pid {
+            return; // exited and reaped
+        }
+        if reaped == -1 {
+            // Not our child (leftover from a previous app run): wait for the
+            // process itself to disappear, then bail.
+            while Instant::now() < deadline && unsafe { libc::kill(raw_pid, 0) == 0 } {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+            unsafe { libc::waitpid(raw_pid, std::ptr::null_mut(), 0) };
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn fake_ap_status_linux() -> FakeApStatus {
@@ -724,10 +763,4 @@ fn pid_alive(pid: u32) -> bool {
         };
     }
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-}
-
-fn signal_term(pid: u32) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
 }
