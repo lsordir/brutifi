@@ -175,6 +175,9 @@ where
     }
 
     let _ = drop_redirect(&redirect_slot);
+    if cfg!(target_os = "linux") {
+        linux_nat_cleanup();
+    }
     on_event(PortalEvent::Log(
         "captive portal stopped — pf rules restored".to_string(),
     ));
@@ -259,6 +262,25 @@ where
             // gets real internet. One unlock frees every connected client.
             if !ctx.unlocked.swap(true, Ordering::SeqCst) {
                 let restored = drop_redirect(&ctx.redirect_slot);
+
+                // On Linux the AP has no forwarding at all — enable NAT
+                // through the Kali host's uplink so "enter code → internet"
+                // actually delivers internet.
+                if cfg!(target_os = "linux") {
+                    match unlock_internet_linux() {
+                        Ok(()) => {
+                            (ctx.on_event)(PortalEvent::Log(
+                                "🔓 NAT enabled — clients now reach the real internet".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            (ctx.on_event)(PortalEvent::Log(format!(
+                                "⚠️ NAT unlock failed ({e}) — clients stay offline"
+                            )));
+                        }
+                    }
+                }
+
                 (ctx.on_event)(PortalEvent::Log(format!(
                     "🔓 access code accepted — interception {} removed, internet unblocked",
                     if restored {
@@ -689,6 +711,152 @@ fn enable_redirect_linux(port: u16) -> Result<Redirect> {
     }
 
     Ok(Redirect::Iptables { iface, port })
+}
+
+/// The default-route interface (the Kali host's internet uplink).
+fn default_route_interface() -> Option<String> {
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let mut tokens = line.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token == "dev" {
+                return tokens.next().map(str::to_string);
+            }
+        }
+    }
+    None
+}
+
+/// Enable NAT so AP clients reach the real internet through the host uplink.
+/// Runs once, when an access code is accepted.
+fn unlock_internet_linux() -> Result<()> {
+    let ap_iface = find_ap_interface_linux()
+        .or_else(super::network::first_wireless_interface_linux)
+        .ok_or_else(|| anyhow!("AP interface not found"))?;
+    let uplink = default_route_interface().filter(|dev| dev != &ap_iface);
+
+    // Remember the uplink so the portal teardown can undo the rules.
+    let _ = fs::write(
+        "/tmp/brutifi_portal_nat",
+        uplink.clone().unwrap_or_default(),
+    );
+
+    let _ = fs::write("/proc/sys/net/ipv4/ip_forward", b"1");
+
+    if let Some(up) = &uplink {
+        for args in [
+            vec![
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                up,
+                "-j",
+                "MASQUERADE",
+            ],
+            vec!["-A", "FORWARD", "-i", &ap_iface, "-o", up, "-j", "ACCEPT"],
+            vec![
+                "-A",
+                "FORWARD",
+                "-i",
+                up,
+                "-o",
+                &ap_iface,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+        ] {
+            let ok = Command::new("iptables").args(&args).output();
+            match ok {
+                Ok(o) if o.status.success() => {}
+                other => {
+                    let stderr = other
+                        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                        .unwrap_or_else(|e| e.to_string());
+                    return Err(anyhow!("iptables {:?} failed: {}", args, stderr));
+                }
+            }
+        }
+    } else {
+        return Err(anyhow!(
+            "no internet uplink found (default route) — nothing to share"
+        ));
+    }
+
+    // Restart dnsmasq WITHOUT the catch-all DNS hijack so clients resolve
+    // real names again (they keep using 192.168.87.1 as their resolver).
+    let gateway = super::rogue_ap::AP_GATEWAY;
+    let clean_conf = format!(
+        "interface={ap_iface}\nbind-interfaces\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{gateway}\ndhcp-option=6,{gateway}\nresolv-file=/etc/resolv.conf\nlog-facility=/tmp/brutifi_dnsmasq.log\n"
+    );
+    fs::write(super::rogue_ap::DNSMASQ_CONF, clean_conf)
+        .context("failed to rewrite the dnsmasq config")?;
+    let _ = Command::new("pkill")
+        .args(["-f", super::rogue_ap::DNSMASQ_CONF])
+        .output();
+    Command::new("dnsmasq")
+        .args([
+            "--keep-in-foreground",
+            "--conf-file",
+            super::rogue_ap::DNSMASQ_CONF,
+        ])
+        .spawn()
+        .context("failed to restart dnsmasq as a plain resolver")?;
+
+    Ok(())
+}
+
+/// Best-effort removal of the NAT rules added by `unlock_internet_linux`.
+fn linux_nat_cleanup() {
+    let uplink = fs::read_to_string("/tmp/brutifi_portal_nat")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if uplink.is_empty() {
+        return;
+    }
+    let ap_iface =
+        find_ap_interface_linux().or_else(super::network::first_wireless_interface_linux);
+    if let Some(ap) = ap_iface {
+        for args in [
+            vec![
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-o",
+                &uplink,
+                "-j",
+                "MASQUERADE",
+            ],
+            vec!["-D", "FORWARD", "-i", &ap, "-o", &uplink, "-j", "ACCEPT"],
+            vec![
+                "-D",
+                "FORWARD",
+                "-i",
+                &uplink,
+                "-o",
+                &ap,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ],
+        ] {
+            let _ = Command::new("iptables").args(&args).output();
+        }
+    }
+    let _ = fs::remove_file("/tmp/brutifi_portal_nat");
 }
 
 /// The interface holding the AP gateway address (`ip -4 addr show`).

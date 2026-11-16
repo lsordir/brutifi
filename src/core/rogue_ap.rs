@@ -540,7 +540,7 @@ print("up:\(iface.ssid() ?? "")")
 // ============================================================================
 
 const HOSTAPD_CONF: &str = "/tmp/brutifi_hostapd.conf";
-const DNSMASQ_CONF: &str = "/tmp/brutifi_dnsmasq.conf";
+pub(crate) const DNSMASQ_CONF: &str = "/tmp/brutifi_dnsmasq.conf";
 /// Gateway/host address of the AP subnet on Linux (portal.rs looks for it).
 pub(crate) const AP_GATEWAY: &str = "192.168.87.1";
 
