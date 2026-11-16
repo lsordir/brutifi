@@ -58,17 +58,44 @@ impl BruteforceApp {
         Task::none()
     }
 
-    /// Download captured PCAP file
+    /// Download captured PCAP file.
+    ///
+    /// First tries to open a native file-save dialog. If the dialog fails to
+    /// open (common on Linux when running with `sudo` — no display session),
+    /// falls back to copying the file to the real user's home directory.
     pub fn handle_download_captured_pcap(&self) -> Task<Message> {
+        let output_file = self.scan_capture_screen.output_file.clone();
         Task::perform(
-            async {
-                rfd::AsyncFileDialog::new()
+            async move {
+                // Try native file dialog first.
+                let dialog_result = rfd::AsyncFileDialog::new()
                     .set_title("Save Captured PCAP")
                     .add_filter("PCAP files", &["pcap"])
                     .set_file_name("capture.pcap")
                     .save_file()
                     .await
-                    .map(|handle| handle.path().to_path_buf())
+                    .map(|handle| handle.path().to_path_buf());
+
+                if dialog_result.is_some() {
+                    return dialog_result;
+                }
+
+                // Dialog returned None — on Linux under sudo this is expected.
+                // Fall back: copy to the real user's home directory.
+                let home = real_user_home();
+                if let Some(home_dir) = home {
+                    let dest = PathBuf::from(home_dir).join("capture.pcap");
+                    let src = PathBuf::from(&output_file);
+                    if src.exists() {
+                        if fs::copy(&src, &dest).is_ok() {
+                            // Fix ownership so the real user can read it (sudo
+                            // creates files owned by root).
+                            fix_file_ownership(&dest);
+                            return Some(dest);
+                        }
+                    }
+                }
+                None
             },
             Message::SaveCapturedPcap,
         )
@@ -78,20 +105,26 @@ impl BruteforceApp {
     pub fn handle_save_captured_pcap(&mut self, path: Option<PathBuf>) -> Task<Message> {
         if let Some(dest) = path {
             let src = PathBuf::from(&self.scan_capture_screen.output_file);
-            if src.exists() {
-                if let Err(e) = fs::copy(&src, &dest) {
-                    self.scan_capture_screen.error_message =
-                        Some(format!("Failed to save capture: {}", e));
+            // If source and dest differ, copy; if they're the same file the
+            // fallback path already placed it at dest.
+            if src != dest {
+                if src.exists() {
+                    if let Err(e) = fs::copy(&src, &dest) {
+                        self.scan_capture_screen.error_message =
+                            Some(format!("Failed to save capture: {}", e));
+                        self.persist_state();
+                        return Task::none();
+                    }
                 } else {
-                    self.scan_capture_screen.last_saved_capture_path =
-                        Some(dest.display().to_string());
-                    self.crack_screen.handshake_path = dest.display().to_string();
-                    self.add_capture_log(format!("✅ Capture saved to {}", dest.display()));
+                    self.scan_capture_screen.error_message =
+                        Some(format!("Capture file not found: {}", src.display()));
+                    self.persist_state();
+                    return Task::none();
                 }
-            } else {
-                self.scan_capture_screen.error_message =
-                    Some(format!("Capture file not found: {}", src.display()));
             }
+            self.scan_capture_screen.last_saved_capture_path = Some(dest.display().to_string());
+            self.crack_screen.handshake_path = dest.display().to_string();
+            self.add_capture_log(format!("✅ Capture saved to {}", dest.display()));
         }
         self.persist_state();
         Task::none()
@@ -353,6 +386,46 @@ impl BruteforceApp {
         self.scan_capture_screen.log_messages.push(msg);
         if self.scan_capture_screen.log_messages.len() > 50 {
             self.scan_capture_screen.log_messages.remove(0);
+        }
+    }
+}
+
+/// Get the real user's home directory (not root's when running under sudo).
+fn real_user_home() -> Option<String> {
+    // When launched via `sudo`, $HOME is root's home but $SUDO_USER holds the
+    // real username. Use that to find the real home directory.
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if !sudo_user.is_empty() && sudo_user != "root" {
+            // Try passwd lookup via getent (portable across Linux distros).
+            if let Ok(output) = std::process::Command::new("getent")
+                .args(["passwd", &sudo_user])
+                .output()
+            {
+                if output.status.success() {
+                    let line = String::from_utf8_lossy(&output.stdout);
+                    // Format: user:x:uid:gid:gecos:home:shell
+                    if let Some(home) = line.split(':').nth(5) {
+                        return Some(home.to_string());
+                    }
+                }
+            }
+            // Fallback: /home/<user>
+            return Some(format!("/home/{}", sudo_user));
+        }
+    }
+    std::env::var("HOME").ok()
+}
+
+/// Best-effort: change file ownership to the real user when running under sudo.
+fn fix_file_ownership(path: &std::path::Path) {
+    if let Ok(sudo_uid) = std::env::var("SUDO_UID") {
+        if let Ok(sudo_gid) = std::env::var("SUDO_GID") {
+            let _ = std::process::Command::new("chown")
+                .args([
+                    &format!("{}:{}", sudo_uid, sudo_gid),
+                    &path.display().to_string(),
+                ])
+                .output();
         }
     }
 }
