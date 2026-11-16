@@ -582,22 +582,30 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
 
     // 3. dnsmasq: DHCP + DNS — every query resolves to this host so
     //    captive-portal probes reach the portal (iptables redirects :80).
-    //    `dhcp-authoritative` makes DHCP offers immediate; queries are logged
-    //    for debugging.
+    //    `dhcp-authoritative` makes DHCP offers immediate; `bind-dynamic`
+    //    survives the interface flap hostapd can cause; queries are logged
+    //    for debugging. Daemon stderr is captured for post-mortem.
     let dnsmasq_conf = format!(
-        "interface={iface}\nbind-interfaces\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\nlog-facility=/tmp/brutifi_dnsmasq.log\nlog-queries\n"
+        "interface={iface}\nbind-dynamic\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\nlog-facility=/tmp/brutifi_dnsmasq.log\nlog-queries\n"
     );
     fs::write(DNSMASQ_CONF, dnsmasq_conf).context("failed to write the dnsmasq config")?;
 
-    // 4. Launch dnsmasq (keep in foreground so the PID is ours) + hostapd.
+    // 4. Launch dnsmasq (keep in foreground so the PID is ours) + hostapd,
+    //    with their stderr captured so a fast exit is diagnosable.
+    let dnsmasq_err = fs::File::create("/tmp/brutifi_dnsmasq.err")
+        .context("failed to create the dnsmasq error log")?;
     let dnsmasq = Command::new("dnsmasq")
         .args(["--keep-in-foreground", "--conf-file", DNSMASQ_CONF])
+        .stderr(dnsmasq_err)
         .spawn()
         .context("failed to start dnsmasq (is port 53 already in use?)")?;
     let dnsmasq_pid = dnsmasq.id();
 
+    let hostapd_err = fs::File::create("/tmp/brutifi_hostapd.err")
+        .context("failed to create the hostapd error log")?;
     let hostapd = Command::new("hostapd")
         .arg(HOSTAPD_CONF)
+        .stderr(hostapd_err)
         .spawn()
         .context("failed to start hostapd")?;
     let hostapd_pid = hostapd.id();
@@ -610,14 +618,14 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
         log_step("dnsmasq exited immediately — rolling back");
         let _ = stop_fake_ap_linux();
         return Err(anyhow!(
-            "dnsmasq exited immediately — port 53 or 67 is already in use (another dnsmasq? run 'pgrep -a dnsmasq' and 'sudo ss -lunp | grep -E \":53 |:67 \"'). Stop the conflicting service and try again"
+            "dnsmasq exited immediately — see /tmp/brutifi_dnsmasq.err for its error (often a port 53/67 conflict: 'sudo ss -lunp | grep -E \":53 |:67 \"')"
         ));
     }
     if !pid_alive(hostapd_pid) {
         log_step("hostapd exited immediately — rolling back");
         let _ = stop_fake_ap_linux();
         return Err(anyhow!(
-            "hostapd exited immediately — run 'hostapd {HOSTAPD_CONF}' manually to see why (the driver may not support AP mode)"
+            "hostapd exited immediately — see /tmp/brutifi_hostapd.err (the driver may not support AP mode)"
         ));
     }
 

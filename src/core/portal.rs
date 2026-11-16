@@ -606,8 +606,9 @@ fn disable_redirect(redirect: &Redirect) -> Result<()> {
     match redirect {
         Redirect::Pf(pf) => disable_redirect_pf(pf),
         Redirect::Iptables { iface, port } => {
-            // Deletes mirror the -A rules exactly (80 + DNS hijacks).
-            let rules: [&[&str]; 3] = [
+            let port_str = port.to_string();
+            // Deletes mirror the -A rules exactly (redirects + walled garden).
+            let nat_rules: [&[&str]; 3] = [
                 &[
                     "-p",
                     "tcp",
@@ -616,7 +617,7 @@ fn disable_redirect(redirect: &Redirect) -> Result<()> {
                     "-j",
                     "REDIRECT",
                     "--to-port",
-                    &port.to_string(),
+                    &port_str,
                 ],
                 &[
                     "-p",
@@ -639,22 +640,38 @@ fn disable_redirect(redirect: &Redirect) -> Result<()> {
                     "53",
                 ],
             ];
-            for rule in rules {
+            for rule in nat_rules {
                 let _ = Command::new("iptables")
                     .args(["-t", "nat", "-D", "PREROUTING", "-i", iface])
                     .args(rule)
                     .output();
+            }
+            let filter_rules: [&[&str]; 5] = [
+                &["-D", "FORWARD", "-i", iface, "-j", "DROP"],
+                &[
+                    "-D", "INPUT", "-i", iface, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
+                ],
+                &[
+                    "-D", "INPUT", "-i", iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
+                ],
+                &[
+                    "-D", "INPUT", "-i", iface, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+                ],
+                &["-D", "INPUT", "-i", iface, "-j", "DROP"],
+            ];
+            for rule in filter_rules {
+                let _ = Command::new("iptables").args(rule).output();
             }
             Ok(())
         }
     }
 }
 
-/// Linux: nat PREROUTING rules scoped to the AP interface:
-/// - port 80 → the portal HTTP server, so captive-portal detection probes
-///   hit the login page;
-/// - port 53 (UDP/TCP) → dnsmasq, so even clients with a hardcoded DNS
-///   server (e.g. 8.8.8.8) resolve everything to this host.
+/// Linux: walled-garden firewall on the AP interface.
+/// nat rules: port 80 → portal, port 53 → dnsmasq (catches hardcoded DNS).
+/// filter rules: clients may ONLY reach DHCP, DNS and the portal —
+/// everything else (any internet, any other host/port) is dropped until an
+/// access code is accepted.
 fn enable_redirect_linux(port: u16) -> Result<Redirect> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(anyhow!("root required"));
@@ -663,8 +680,9 @@ fn enable_redirect_linux(port: u16) -> Result<Redirect> {
     let iface = find_ap_interface_linux()
         .or_else(super::network::first_wireless_interface_linux)
         .ok_or_else(|| anyhow!("AP interface not found — is the fake AP running?"))?;
+    let port_str = port.to_string();
 
-    let rules: [&[&str]; 3] = [
+    let nat_rules: [&[&str]; 3] = [
         &[
             "-p",
             "tcp",
@@ -673,7 +691,7 @@ fn enable_redirect_linux(port: u16) -> Result<Redirect> {
             "-j",
             "REDIRECT",
             "--to-port",
-            &port.to_string(),
+            &port_str,
         ],
         &[
             "-p",
@@ -696,7 +714,7 @@ fn enable_redirect_linux(port: u16) -> Result<Redirect> {
             "53",
         ],
     ];
-    for rule in rules {
+    for rule in nat_rules {
         let add = Command::new("iptables")
             .args(["-t", "nat", "-A", "PREROUTING", "-i", &iface])
             .args(rule)
@@ -705,6 +723,34 @@ fn enable_redirect_linux(port: u16) -> Result<Redirect> {
         if !add.status.success() {
             return Err(anyhow!(
                 "iptables rejected the redirect: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            ));
+        }
+    }
+
+    // Walled garden: forward nothing, and locally allow only DHCP (67),
+    // DNS (53) and the portal (8080 — port 80 arrives post-REDIRECT).
+    let filter_rules: [&[&str]; 5] = [
+        &["-A", "FORWARD", "-i", &iface, "-j", "DROP"],
+        &[
+            "-A", "INPUT", "-i", &iface, "-p", "udp", "--dport", "53", "-j", "ACCEPT",
+        ],
+        &[
+            "-A", "INPUT", "-i", &iface, "-p", "udp", "--dport", "67", "-j", "ACCEPT",
+        ],
+        &[
+            "-A", "INPUT", "-i", &iface, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
+        ],
+        &["-A", "INPUT", "-i", &iface, "-j", "DROP"],
+    ];
+    for rule in filter_rules {
+        let add = Command::new("iptables")
+            .args(rule)
+            .output()
+            .context("failed to run iptables")?;
+        if !add.status.success() {
+            return Err(anyhow!(
+                "iptables rejected the walled-garden rule: {}",
                 String::from_utf8_lossy(&add.stderr).trim()
             ));
         }
@@ -895,10 +941,18 @@ fn enable_redirect_macos(port: u16) -> Result<PfRedirect> {
     })?;
     let was_enabled = pf_enabled();
 
+    // Walled garden: the rdr intercepts HTTP; the filter rules then drop
+    // everything from clients except DHCP, DNS and traffic to this host
+    // (the portal). pf is last-match-wins, so the passes come after the
+    // block. `rdr pass` traffic skips filtering entirely.
     fs::write(
         PF_ANCHOR,
         format!(
-            "rdr pass on {iface} proto tcp from any to any port 80 -> {gateway_ip} port {port}\n"
+            "rdr pass on {iface} proto tcp from any to any port 80 -> {gateway_ip} port {port}\n\
+             block drop in on {iface} all\n\
+             pass in on {iface} proto udp to any port 67\n\
+             pass in on {iface} proto udp to ({iface})\n\
+             pass in on {iface} proto tcp to ({iface})\n"
         ),
     )
     .context("failed to write pf anchor")?;
