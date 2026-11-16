@@ -535,15 +535,9 @@ fn disable_redirect(redirect: &Redirect) -> Result<()> {
     match redirect {
         Redirect::Pf(pf) => disable_redirect_pf(pf),
         Redirect::Iptables { iface, port } => {
-            // Delete mirrors the -A rule exactly.
-            let _ = Command::new("iptables")
-                .args([
-                    "-t",
-                    "nat",
-                    "-D",
-                    "PREROUTING",
-                    "-i",
-                    iface,
+            // Deletes mirror the -A rules exactly (80 + DNS hijacks).
+            let rules: [&[&str]; 3] = [
+                &[
                     "-p",
                     "tcp",
                     "--dport",
@@ -552,32 +546,55 @@ fn disable_redirect(redirect: &Redirect) -> Result<()> {
                     "REDIRECT",
                     "--to-port",
                     &port.to_string(),
-                ])
-                .output();
+                ],
+                &[
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "53",
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    "53",
+                ],
+                &[
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "53",
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    "53",
+                ],
+            ];
+            for rule in rules {
+                let _ = Command::new("iptables")
+                    .args(["-t", "nat", "-D", "PREROUTING", "-i", iface])
+                    .args(rule)
+                    .output();
+            }
             Ok(())
         }
     }
 }
 
-/// Linux: nat PREROUTING rule scoped to the AP interface. dnsmasq already
-/// resolves every client query to this host, so captive-portal detection
-/// probes hit this redirect and pop the login page.
+/// Linux: nat PREROUTING rules scoped to the AP interface:
+/// - port 80 → the portal HTTP server, so captive-portal detection probes
+///   hit the login page;
+/// - port 53 (UDP/TCP) → dnsmasq, so even clients with a hardcoded DNS
+///   server (e.g. 8.8.8.8) resolve everything to this host.
 fn enable_redirect_linux(port: u16) -> Result<Redirect> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(anyhow!("root required"));
     }
 
     let iface = find_ap_interface_linux()
+        .or_else(super::network::first_wireless_interface_linux)
         .ok_or_else(|| anyhow!("AP interface not found — is the fake AP running?"))?;
 
-    let add = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "PREROUTING",
-            "-i",
-            &iface,
+    let rules: [&[&str]; 3] = [
+        &[
             "-p",
             "tcp",
             "--dport",
@@ -586,14 +603,40 @@ fn enable_redirect_linux(port: u16) -> Result<Redirect> {
             "REDIRECT",
             "--to-port",
             &port.to_string(),
-        ])
-        .output()
-        .context("failed to run iptables (sudo apt install iptables)")?;
-    if !add.status.success() {
-        return Err(anyhow!(
-            "iptables rejected the redirect: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        ));
+        ],
+        &[
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            "53",
+        ],
+        &[
+            "-p",
+            "tcp",
+            "--dport",
+            "53",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            "53",
+        ],
+    ];
+    for rule in rules {
+        let add = Command::new("iptables")
+            .args(["-t", "nat", "-A", "PREROUTING", "-i", &iface])
+            .args(rule)
+            .output()
+            .context("failed to run iptables (sudo apt install iptables)")?;
+        if !add.status.success() {
+            return Err(anyhow!(
+                "iptables rejected the redirect: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            ));
+        }
     }
 
     Ok(Redirect::Iptables { iface, port })

@@ -86,13 +86,11 @@ impl BruteforceApp {
                 if let Some(home_dir) = home {
                     let dest = PathBuf::from(home_dir).join("capture.pcap");
                     let src = PathBuf::from(&output_file);
-                    if src.exists() {
-                        if fs::copy(&src, &dest).is_ok() {
-                            // Fix ownership so the real user can read it (sudo
-                            // creates files owned by root).
-                            fix_file_ownership(&dest);
-                            return Some(dest);
-                        }
+                    if src.exists() && fs::copy(&src, &dest).is_ok() {
+                        // Fix ownership so the real user can read it (sudo
+                        // creates files owned by root).
+                        fix_file_ownership(&dest);
+                        return Some(dest);
                     }
                 }
                 None

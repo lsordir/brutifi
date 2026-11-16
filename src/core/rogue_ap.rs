@@ -582,8 +582,10 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
 
     // 3. dnsmasq: DHCP + DNS — every query resolves to this host so
     //    captive-portal probes reach the portal (iptables redirects :80).
+    //    `dhcp-authoritative` makes DHCP offers immediate; queries are logged
+    //    for debugging.
     let dnsmasq_conf = format!(
-        "interface={iface}\nbind-interfaces\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\n"
+        "interface={iface}\nbind-interfaces\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\nlog-facility=/tmp/brutifi_dnsmasq.log\nlog-queries\n"
     );
     fs::write(DNSMASQ_CONF, dnsmasq_conf).context("failed to write the dnsmasq config")?;
 
@@ -600,8 +602,17 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
         .context("failed to start hostapd")?;
     let hostapd_pid = hostapd.id();
 
-    // A bad driver/channel makes hostapd exit almost immediately.
+    // A bad driver/channel makes hostapd exit almost immediately; dnsmasq
+    // dies just as fast when port 53/67 is already taken (e.g. another DNS
+    // server) — without DHCP/DNS the portal can never pop on clients.
     std::thread::sleep(Duration::from_millis(1800));
+    if !pid_alive(dnsmasq_pid) {
+        log_step("dnsmasq exited immediately — rolling back");
+        let _ = stop_fake_ap_linux();
+        return Err(anyhow!(
+            "dnsmasq exited immediately — port 53 or 67 is already in use. Check: sudo ss -lunp | grep -E ':53 |:67 ' (stop the conflicting service, e.g. systemd-resolved)"
+        ));
+    }
     if !pid_alive(hostapd_pid) {
         log_step("hostapd exited immediately — rolling back");
         let _ = stop_fake_ap_linux();
