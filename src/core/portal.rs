@@ -22,7 +22,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -76,6 +76,10 @@ pub struct PortalConfig {
     pub verify: Option<(PathBuf, String)>,
     /// File every submitted code is appended to.
     pub codes_file: String,
+    /// Without a verifier: codes at least this long are accepted, shown the
+    /// success page, and the interception is removed so the client gets
+    /// real internet ("enter the code → internet works").
+    pub accept_min_len: usize,
 }
 
 /// Events surfaced by a running portal.
@@ -106,21 +110,27 @@ where
     let verifier = load_verifier(&config, &on_event);
 
     // Intercept port 80 of portal clients (pf / iptables) so captive-portal
-    // detection probes land on this server.
-    let redirect = enable_redirect(config.port);
-    let redirect_active = redirect.is_ok();
-    if let Err(ref e) = redirect {
-        on_event(PortalEvent::Log(format!(
-            "⚠️ port-80 redirect inactive ({e}) — the portal only serves direct requests"
-        )));
+    // detection probes land on this server. The rule lives in a slot so an
+    // accepted code can drop it at runtime ("enter code → internet works").
+    let redirect_slot: Arc<Mutex<Option<Result<Redirect, anyhow::Error>>>> =
+        Arc::new(Mutex::new(Some(enable_redirect(config.port))));
+    let redirect_active = redirect_slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|r| r.is_ok());
+    if !redirect_active {
+        if let Some(Err(ref e)) = *redirect_slot.lock().unwrap() {
+            on_event(PortalEvent::Log(format!(
+                "⚠️ port-80 redirect inactive ({e}) — the portal only serves direct requests"
+            )));
+        }
     }
 
     let listener = match TcpListener::bind(("0.0.0.0", config.port)) {
         Ok(listener) => listener,
         Err(e) => {
-            if let Ok(redirect) = redirect {
-                let _ = disable_redirect(&redirect);
-            }
+            let _ = drop_redirect(&redirect_slot);
             return Err(anyhow!(
                 "failed to bind port {} ({}). Is another portal instance running?",
                 config.port,
@@ -135,6 +145,8 @@ where
         verifying: verifier.is_some(),
     });
 
+    let unlocked = Arc::new(AtomicBool::new(false));
+
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -145,7 +157,10 @@ where
                     ssid: config.ssid.clone(),
                     verifier: verifier.clone(),
                     codes_file: config.codes_file.clone(),
+                    accept_min_len: config.accept_min_len,
                     state: state.clone(),
+                    unlocked: unlocked.clone(),
+                    redirect_slot: redirect_slot.clone(),
                     on_event: on_event.clone(),
                 };
                 std::thread::spawn(move || handle_connection(stream, ctx));
@@ -159,13 +174,20 @@ where
         }
     }
 
-    if let Ok(redirect) = redirect {
-        let _ = disable_redirect(&redirect);
-    }
+    let _ = drop_redirect(&redirect_slot);
     on_event(PortalEvent::Log(
         "captive portal stopped — pf rules restored".to_string(),
     ));
     Ok(())
+}
+
+/// Take the redirect out of the slot (if still there) and restore the
+/// original firewall configuration.
+fn drop_redirect(redirect_slot: &Arc<Mutex<Option<Result<Redirect, anyhow::Error>>>>) -> bool {
+    match redirect_slot.lock().unwrap().take() {
+        Some(Ok(redirect)) => disable_redirect(&redirect).is_ok(),
+        _ => false,
+    }
 }
 
 // --- Connection handling ----------------------------------------------------
@@ -174,7 +196,12 @@ struct ConnContext<F> {
     ssid: String,
     verifier: Option<Arc<Handshake>>,
     codes_file: String,
+    /// Without a verifier: minimum code length that gets accepted.
+    accept_min_len: usize,
     state: Arc<PortalState>,
+    /// Set once a code was accepted; the interception is then removed.
+    unlocked: Arc<AtomicBool>,
+    redirect_slot: Arc<Mutex<Option<Result<Redirect, anyhow::Error>>>>,
     on_event: F,
 }
 
@@ -214,19 +241,40 @@ where
             return;
         }
 
-        let valid = ctx.verifier.as_ref().map(|hs| verify_code(hs, &code));
+        // With a captured handshake: only the correct code passes.
+        // Without one: any code of at least `accept_min_len` characters is
+        // accepted ("enter the code → internet works").
+        let valid = Some(match ctx.verifier.as_ref() {
+            Some(hs) => verify_code(hs, &code),
+            None => code.chars().count() >= ctx.accept_min_len,
+        });
         append_code(&ctx.codes_file, &code, valid);
         (ctx.on_event)(PortalEvent::Code {
             code: code.clone(),
             valid,
         });
 
-        let page = if valid == Some(true) {
-            success_page(&ctx.ssid)
+        if valid == Some(true) {
+            // Accepted — drop the port-80/DNS interception so the client
+            // gets real internet. One unlock frees every connected client.
+            if !ctx.unlocked.swap(true, Ordering::SeqCst) {
+                let restored = drop_redirect(&ctx.redirect_slot);
+                (ctx.on_event)(PortalEvent::Log(format!(
+                    "🔓 access code accepted — interception {} removed, internet unblocked",
+                    if restored {
+                        "rules"
+                    } else {
+                        "(already inactive)"
+                    }
+                )));
+            }
+            respond(&mut stream, &success_page(&ctx.ssid));
         } else {
-            login_page(&ctx.ssid, Some("Incorrect access code. Please try again."))
-        };
-        respond(&mut stream, &page);
+            respond(
+                &mut stream,
+                &login_page(&ctx.ssid, Some("Incorrect access code. Please try again.")),
+            );
+        }
     } else {
         // Every other request (including captive-portal detection probes)
         // gets the login page, which triggers the OS login window.
@@ -727,10 +775,12 @@ mod tests {
     use super::*;
 
     /// The portal must serve the login page to any client (that is what
-    /// makes captive-portal detection pop the login window) and harvest
-    /// submitted codes, all without root — pf setup just fails gracefully.
+    /// makes captive-portal detection pop the login window), reject short
+    /// codes, and accept codes of the minimum length ("enter code →
+    /// internet works"), all without root — firewall setup just fails
+    /// gracefully.
     #[test]
-    fn serves_login_page_and_harvests_codes() {
+    fn serves_login_page_rejects_short_accepts_valid_codes() {
         let port = 18080;
         let codes_file = "/tmp/brutifi_portal_codes_test.txt";
         let _ = fs::remove_file(codes_file);
@@ -744,6 +794,7 @@ mod tests {
                     port,
                     verify: None,
                     codes_file: codes_file.to_string(),
+                    accept_min_len: 8,
                 },
                 worker_state,
                 |_| {},
@@ -767,15 +818,18 @@ mod tests {
         assert!(page.contains("TestNet"));
         assert!(page.contains("Access code"));
 
-        // POST a code → rejected (no handshake on file) and harvested.
-        let body = "code=12345678";
-        let post = format!(
-            "POST /submit HTTP/1.1\r\nHost: captive.probe\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let reply = http_roundtrip(port, &post);
+        // Short code → rejected, keep asking.
+        let short = post_body("code=12345");
+        let reply = http_roundtrip(port, &short);
         assert!(reply.contains("Incorrect access code"));
+
+        // 8+ characters → accepted, success page (internet unblocked).
+        let good = post_body("code=12345678");
+        let reply = http_roundtrip(port, &good);
+        assert!(
+            reply.contains("Connected"),
+            "accepted code gets the success page"
+        );
 
         state.stop();
         handle
@@ -784,11 +838,17 @@ mod tests {
             .expect("portal ran cleanly");
 
         let logged = fs::read_to_string(codes_file).unwrap_or_default();
-        assert!(
-            logged.contains("12345678"),
-            "code appended to the codes file"
-        );
+        assert!(logged.contains("12345"), "rejected code still harvested");
+        assert!(logged.contains("12345678"), "accepted code harvested");
         let _ = fs::remove_file(codes_file);
+    }
+
+    fn post_body(body: &str) -> String {
+        format!(
+            "POST /submit HTTP/1.1\r\nHost: captive.probe\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
     }
 
     fn http_roundtrip(port: u16, raw: &str) -> String {

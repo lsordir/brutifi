@@ -231,6 +231,9 @@ impl BruteforceApp {
             port: PORTAL_PORT,
             verify,
             codes_file: "/tmp/brutifi_portal_codes.txt".to_string(),
+            // Without a handshake on file: any code of 8+ characters is
+            // accepted and the client is let through to the internet.
+            accept_min_len: 8,
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -246,8 +249,6 @@ impl BruteforceApp {
 
     /// Background progress for the captive portal
     pub fn handle_portal_progress(&mut self, progress: PortalProgress) -> Task<Message> {
-        // A verified code ends the whole attack — tear the AP down next.
-        let mut follow_up: Option<Task<Message>> = None;
         let terminal = match progress {
             PortalProgress::Started {
                 port,
@@ -257,12 +258,12 @@ impl BruteforceApp {
                 let redirect = if redirect_active {
                     "login interception ON"
                 } else {
-                    "no pf redirect"
+                    "no port-80 redirect"
                 };
                 let verifying = if verifying {
                     ", verifying codes against the handshake"
                 } else {
-                    ""
+                    ", accepting codes of 8+ characters"
                 };
                 self.add_capture_log(format!(
                     "🪟 Captive portal live on :{port} ({redirect}{verifying})"
@@ -282,14 +283,13 @@ impl BruteforceApp {
                 match valid {
                     Some(true) => {
                         self.add_capture_log(format!(
-                            "🎉 Access code '{}' is CORRECT — verified against the handshake!",
+                            "🎉 Access code '{}' accepted — internet unblocked (AP stays up)",
                             code
                         ));
                         self.crack_screen.found_password = Some(code);
-                        follow_up = Some(Task::done(Message::StopFakeAp));
                     }
                     Some(false) => {
-                        self.add_capture_log(format!("✗ Code '{}' rejected (verified)", code));
+                        self.add_capture_log(format!("✗ Code '{}' rejected", code));
                     }
                     None => {
                         self.add_capture_log(format!("📝 Code submitted: '{}'", code));
@@ -314,6 +314,6 @@ impl BruteforceApp {
             self.scan_capture_screen.portal_running = false;
             self.persist_state();
         }
-        follow_up.take().unwrap_or(Task::none())
+        Task::none()
     }
 }
