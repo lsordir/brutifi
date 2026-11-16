@@ -595,7 +595,11 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
     //    survives the interface flap hostapd can cause; queries are logged
     //    for debugging. Daemon stderr is captured for post-mortem.
     let dnsmasq_conf = format!(
-        "interface={iface}\nbind-dynamic\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\nlog-facility=/tmp/brutifi_dnsmasq.log\nlog-queries\n"
+        // No log-facility: dnsmasq drops to an unprivileged user before
+        // opening it, which dies on root-owned leftovers ("cannot open log:
+        // Permission denied"). Logging goes to stderr, which the app already
+        // captures in /tmp/brutifi_dnsmasq.err.
+        "interface={iface}\nbind-dynamic\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{AP_GATEWAY}\ndhcp-option=6,{AP_GATEWAY}\naddress=/#/{AP_GATEWAY}\nno-resolv\nlog-queries\n"
     );
     fs::write(DNSMASQ_CONF, dnsmasq_conf).context("failed to write the dnsmasq config")?;
 
@@ -684,6 +688,7 @@ fn stop_fake_ap_linux() -> Result<()> {
     let _ = fs::remove_file(HOSTAPD_CONF);
     let _ = fs::remove_file(DNSMASQ_CONF);
     let _ = fs::remove_file(STATE_FILE);
+    let _ = fs::remove_file("/tmp/brutifi_dnsmasq.log"); // stale legacy log
     log_step("linux fake AP stopped, interface restored");
     Ok(())
 }

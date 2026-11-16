@@ -859,7 +859,8 @@ fn unlock_internet_linux() -> Result<()> {
     // real names again (they keep using 192.168.87.1 as their resolver).
     let gateway = super::rogue_ap::AP_GATEWAY;
     let clean_conf = format!(
-        "interface={ap_iface}\nbind-interfaces\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{gateway}\ndhcp-option=6,{gateway}\nresolv-file=/etc/resolv.conf\nlog-facility=/tmp/brutifi_dnsmasq.log\n"
+        // stderr (captured) instead of log-facility — see rogue_ap.rs note.
+        "interface={ap_iface}\nbind-interfaces\ndhcp-authoritative\ndhcp-range=192.168.87.10,192.168.87.150,12h\ndhcp-option=3,{gateway}\ndhcp-option=6,{gateway}\nresolv-file=/etc/resolv.conf\nlog-queries\n"
     );
     fs::write(super::rogue_ap::DNSMASQ_CONF, clean_conf)
         .context("failed to rewrite the dnsmasq config")?;
