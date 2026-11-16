@@ -610,7 +610,7 @@ fn start_fake_ap_linux(ssid: &str) -> Result<()> {
         log_step("dnsmasq exited immediately — rolling back");
         let _ = stop_fake_ap_linux();
         return Err(anyhow!(
-            "dnsmasq exited immediately — port 53 or 67 is already in use. Check: sudo ss -lunp | grep -E ':53 |:67 ' (stop the conflicting service, e.g. systemd-resolved)"
+            "dnsmasq exited immediately — port 53 or 67 is already in use (another dnsmasq? run 'pgrep -a dnsmasq' and 'sudo ss -lunp | grep -E \":53 |:67 \"'). Stop the conflicting service and try again"
         ));
     }
     if !pid_alive(hostapd_pid) {
@@ -694,6 +694,21 @@ fn tool_available(name: &str) -> bool {
 
 /// Signal-0 existence check for a PID.
 fn pid_alive(pid: u32) -> bool {
+    // On Linux, kill(pid, 0) also succeeds for *zombie* children (exited but
+    // not yet reaped) — check /proc state so a dead dnsmasq/hostapd is not
+    // mistaken for a healthy daemon.
+    if cfg!(target_os = "linux") {
+        return match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // "<pid> (comm) S ..." — the state letter follows the last ')'.
+            Ok(stat) => !stat
+                .rsplit(')')
+                .next()
+                .unwrap_or("Z")
+                .trim()
+                .starts_with('Z'),
+            Err(_) => false,
+        };
+    }
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
