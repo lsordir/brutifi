@@ -1860,8 +1860,16 @@ fn set_channel_macos(_interface: &str, channel: u32) -> bool {
 // ============================================================================
 
 /// Scan via `iw dev <iface> scan`, falling back to `nmcli` (NetworkManager).
+///
+/// Before scanning we ensure the interface is in managed mode — a previous
+/// capture that crashed without the Drop guard may have left it in monitor
+/// mode, which silently prevents both `iw scan` and `nmcli` from working.
 fn scan_networks_linux(interface: &str) -> Result<Vec<WifiNetwork>> {
-    // Preferred: iw (works headless, needs root).
+    // 0. Safety: make sure the interface is NOT stuck in monitor mode (which
+    //    blocks scanning). If it's already managed this is a harmless no-op.
+    ensure_managed_mode_linux(interface);
+
+    // 1. Preferred: iw (works headless, needs root).
     if let Ok(output) = Command::new("iw").args(["dev", interface, "scan"]).output() {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1869,10 +1877,24 @@ fn scan_networks_linux(interface: &str) -> Result<Vec<WifiNetwork>> {
             if !networks.is_empty() {
                 return Ok(networks);
             }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "[DEBUG] iw scan failed on '{}': {}",
+                interface,
+                stderr.trim()
+            );
         }
     }
 
-    // Fallback: nmcli (no root needed, requires NetworkManager).
+    // 2. Fallback: nmcli (no root needed, requires NetworkManager).
+    //    Trigger a fresh scan first so we don't get stale/empty cache.
+    let _ = Command::new("nmcli")
+        .args(["device", "wifi", "rescan"])
+        .output();
+    // Brief pause so the driver has time to return results.
+    std::thread::sleep(Duration::from_millis(500));
+
     if let Ok(output) = Command::new("nmcli")
         .args([
             "-t",
@@ -1893,9 +1915,117 @@ fn scan_networks_linux(interface: &str) -> Result<Vec<WifiNetwork>> {
         }
     }
 
+    // 3. Last resort: iwlist (older tool, sometimes available when iw is not).
+    if let Ok(output) = Command::new("iwlist").args([interface, "scan"]).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let networks = parse_iwlist_scan(&stdout);
+            if !networks.is_empty() {
+                return Ok(networks);
+            }
+        }
+    }
+
     Err(anyhow!(
-        "no networks found via iw/nmcli — is 'iw' installed and are you running with sudo?"
+        "no networks found via iw/nmcli/iwlist — check: 1) run with sudo, \
+         2) WiFi interface '{}' is correct (try selecting wlan0 or wlp*), \
+         3) iw or nmcli is installed, 4) WiFi adapter supports scanning",
+        interface
     ))
+}
+
+/// Ensure the interface is in managed mode before scanning. If a previous
+/// capture session crashed, the interface may be stuck in monitor mode.
+fn ensure_managed_mode_linux(interface: &str) {
+    // Check current mode — if it's monitor, switch back to managed.
+    if let Ok(output) = Command::new("iw").args(["dev", interface, "info"]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("type monitor") {
+            eprintln!(
+                "[WARN] Interface '{}' is stuck in monitor mode — restoring managed mode for scan",
+                interface
+            );
+            let _ = Command::new("ip")
+                .args(["link", "set", "dev", interface, "down"])
+                .output();
+            let _ = Command::new("iw")
+                .args(["dev", interface, "set", "type", "managed"])
+                .output();
+            let _ = Command::new("ip")
+                .args(["link", "set", "dev", interface, "up"])
+                .output();
+            // Re-enable NetworkManager management so nmcli fallback works.
+            let _ = Command::new("nmcli")
+                .args(["device", "set", interface, "managed", "yes"])
+                .output();
+            // Wait for the driver to settle.
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
+/// Parse `iwlist <iface> scan` output (legacy wireless-tools format).
+fn parse_iwlist_scan(output: &str) -> Vec<WifiNetwork> {
+    let mut networks = Vec::new();
+    let mut ssid = String::new();
+    let mut bssid = String::new();
+    let mut channel = String::new();
+    let mut signal = String::new();
+    let mut security = String::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("Cell ") && trimmed.contains("Address:") {
+            // Flush previous entry.
+            if !bssid.is_empty() {
+                networks.push(WifiNetwork {
+                    ssid: if ssid.is_empty() {
+                        "<Hidden>".to_string()
+                    } else {
+                        std::mem::take(&mut ssid)
+                    },
+                    bssid: std::mem::take(&mut bssid),
+                    channel: std::mem::take(&mut channel),
+                    signal_strength: std::mem::take(&mut signal),
+                    security: std::mem::take(&mut security),
+                });
+            }
+            if let Some(addr) = trimmed.split("Address:").nth(1) {
+                bssid = addr.trim().to_string();
+            }
+            security = "Open".to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("ESSID:") {
+            ssid = rest.trim_matches('"').to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("Channel:") {
+            channel = rest.trim().to_string();
+        } else if trimmed.contains("Signal level=") {
+            if let Some(rest) = trimmed.split("Signal level=").nth(1) {
+                // "Signal level=-61 dBm" or "Signal level=39/100"
+                signal = rest.split_whitespace().next().unwrap_or("-100").to_string();
+            }
+        } else if trimmed.contains("WPA2") || trimmed.contains("RSN") {
+            security = "WPA2".to_string();
+        } else if trimmed.contains("WPA") && security != "WPA2" {
+            security = "WPA".to_string();
+        } else if trimmed.contains("WEP") && security == "Open" {
+            security = "WEP".to_string();
+        }
+    }
+    // Flush last entry.
+    if !bssid.is_empty() {
+        networks.push(WifiNetwork {
+            ssid: if ssid.is_empty() {
+                "<Hidden>".to_string()
+            } else {
+                ssid
+            },
+            bssid,
+            channel,
+            signal_strength: signal,
+            security,
+        });
+    }
+    networks
 }
 
 /// Parse `iw dev <iface> scan` output into networks.
